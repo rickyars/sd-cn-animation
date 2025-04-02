@@ -1,0 +1,53 @@
+# Create a .gitignore file with common Python and PyCharm exclusions
+cat > .gitignore << 'EOL'
+# PyCharm files
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# Other common exclusions
+.DS_Store
+*.log
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+EOL
+
+# Add and commit the .gitignore file
+git add .gitignore
+git commit -m "Add .gitignore file"
