@@ -118,8 +118,8 @@ class Txt2VidNode:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
+    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("first_pass_frames", "second_pass_frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
     FUNCTION = "generate_frames"
     CATEGORY = "animation"
 
@@ -429,7 +429,8 @@ class Txt2VidNode:
         prev_frame = init_frame_np.copy()
 
         # Initialize latent frames array with initial latent
-        all_latents = [latent["samples"].to(device)]
+        first_pass_latents = [latent["samples"].to(device)]  # First pass latents
+        second_pass_latents = [latent["samples"].to(device)]  # Final refined latents
 
         # For the first frame visualization (placeholder):
         h, w = init_frame_np.shape[:2]
@@ -561,6 +562,8 @@ class Txt2VidNode:
                 device
             )
 
+            first_pass_latents.append(inpaint_result["samples"].to(device))
+
             # Decode the inpainted result for visualization and next step
             inpaint_frame_tensor = vae.decode(inpaint_result["samples"])
             inpaint_frame = inpaint_frame_tensor[0].cpu()
@@ -598,7 +601,7 @@ class Txt2VidNode:
             )
 
             # Store this frame's latent - ensure it's on device
-            all_latents.append(fixed_frame_result["samples"].to(device))
+            second_pass_latents.append(fixed_frame_result["samples"].to(device))
 
             # Decode for next iteration
             final_frame_tensor = vae.decode(fixed_frame_result["samples"])
@@ -623,7 +626,8 @@ class Txt2VidNode:
             prev_frame = final_frame_np.copy()
 
         # Stack all latents for output
-        stacked_latents = torch.cat(all_latents, dim=0)
+        stacked_first_pass = torch.cat(first_pass_latents, dim=0)  # Stack first pass latents
+        stacked_second_pass = torch.cat(second_pass_latents, dim=0)  # Stack second pass latents
 
         # Stack tensors into batches
         flow_batch = torch.stack(flow_visualizations)
@@ -645,7 +649,8 @@ class Txt2VidNode:
 
         # Return all visualizations
         return (
-            {"samples": stacked_latents},
+            {"samples": stacked_first_pass},
+            {"samples": stacked_second_pass},
             flow_batch,
             occlusion_batch,
             warped_batch,
