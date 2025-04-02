@@ -118,10 +118,8 @@ class Txt2VidNode:
             }
         }
 
-    #RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
-    #RETURN_NAMES = ("frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
-    RETURN_TYPES = ("LATENT", "IMAGE")
-    RETURN_NAMES = ("frames", "flow_visualization")
+    RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
     FUNCTION = "generate_frames"
     CATEGORY = "animation"
 
@@ -433,13 +431,17 @@ class Txt2VidNode:
         # Initialize latent frames array with initial latent
         all_latents = [latent["samples"].to(device)]
 
-        # For the first frame, add placeholders since we don't have flow/occlusion yet
+        # For the first frame visualization (placeholder):
         h, w = init_frame_np.shape[:2]
-        placeholder = np.zeros((h, w, 3), dtype=np.uint8)
-        flow_visualizations.append(torch.from_numpy(placeholder).permute(2, 0, 1).float() / 255.0)
-        #occlusion_masks.append(torch.from_numpy(placeholder).permute(2, 0, 1).float() / 255.0)
-        #warped_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float() / 255.0)
-        #blended_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float() / 255.0)
+        target_h = (h // 8) * 8
+        target_w = (w // 8) * 8
+
+        # ComfyUI expects IMAGE type in format [B, H, W, C] with values 0-1
+        placeholder = np.zeros((target_h, target_w, 3), dtype=np.float32)
+        flow_visualizations.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())  # Convert to [C, H, W]
+        occlusion_masks.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
+        warped_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
+        blended_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
 
         # Generate the sequence
         print(f"Generating {num_frames} frames")
@@ -499,41 +501,30 @@ class Txt2VidNode:
             blended_frame = pred_next.astype(float) * alpha_mask + warped_frame.astype(float) * (1 - alpha_mask)
             blended_frame = np.clip(blended_frame, 0, 255).astype(np.uint8)
 
-            # After generating pred_flow, pred_occl, pred_next
-            print(f"Debug - pred_flow shape: {pred_flow.shape}, dtype: {pred_flow.dtype}")
-            print(f"Debug - pred_occl shape: {pred_occl.shape}, dtype: {pred_occl.dtype}")
-            print(f"Debug - pred_next shape: {pred_next.shape}, dtype: {pred_next.dtype}")
-            print(f"Debug - warped_frame shape: {warped_frame.shape}, dtype: {warped_frame.dtype}")
-            print(f"Debug - blended_frame shape: {blended_frame.shape}, dtype: {blended_frame.dtype}")
-
-            flow_vis = np.zeros((h, w, 3), dtype=np.uint8)
-            try:
-                fx, fy = pred_flow[:, :, 0], pred_flow[:, :, 1]
-                mag, ang = cv2.cartToPolar(fx, fy)
-                mag_normalized = np.clip(mag / 30, 0, 1)
-
-                hsv = np.zeros((h, w, 3), dtype=np.uint8)
-                hsv[..., 0] = ang * 180 / np.pi / 2
-                hsv[..., 1] = 255
-                hsv[..., 2] = np.minimum(mag_normalized * 255, 255).astype(np.uint8)
-
-                flow_vis = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-            except Exception as e:
-                print(f"Error creating flow visualization: {e}")
-
+            # Create flow visualization
+            flow_vis = self.create_flow_visualization(pred_flow)
+            flow_vis = cv2.resize(flow_vis, (target_w, target_h))  # Ensure consistent size
+            flow_vis = np.clip(flow_vis, 0, 255).astype(np.uint8)
             flow_tensor = torch.from_numpy(flow_vis).permute(2, 0, 1).float() / 255.0
             flow_visualizations.append(flow_tensor)
 
-            # Convert to tensors and add to collections
-            #flow_tensor = torch.from_numpy(flow_vis).permute(2, 0, 1).float() / 255.0
-            #occlusion_tensor = torch.from_numpy(occlusion_vis).permute(2, 0, 1).float() / 255.0
-            #warped_tensor = torch.from_numpy(warped_vis).permute(2, 0, 1).float() / 255.0
-            #blended_tensor = torch.from_numpy(blended_vis).permute(2, 0, 1).float() / 255.0
+            # Same for other visualizations
+            occlusion_vis = np.clip(pred_occl, 0, 255).astype(np.uint8)
+            occlusion_vis = cv2.resize(occlusion_vis, (target_w, target_h))
+            occlusion_tensor = torch.from_numpy(occlusion_vis).permute(2, 0, 1).float() / 255.0
+            occlusion_masks.append(occlusion_tensor)
 
-            #flow_visualizations.append(flow_tensor)
-            #occlusion_masks.append(occlusion_tensor)
-            #warped_frames.append(warped_tensor)
-            #blended_frames.append(blended_tensor)
+            # Create warped frame visualization
+            warped_vis = np.clip(warped_frame, 0, 255).astype(np.uint8)
+            warped_vis = cv2.resize(warped_vis, (target_w, target_h))  # Add this line
+            warped_tensor = torch.from_numpy(warped_vis).permute(2, 0, 1).float() / 255.0
+            warped_frames.append(warped_tensor)
+
+            # Create blended frame visualization
+            blended_vis = np.clip(blended_frame, 0, 255).astype(np.uint8)
+            blended_vis = cv2.resize(blended_vis, (target_w, target_h))  # Add this line
+            blended_tensor = torch.from_numpy(blended_vis).permute(2, 0, 1).float() / 255.0
+            blended_frames.append(blended_tensor)
 
             # Use the blended frame as the base for further processing
             pred_next = blended_frame
@@ -634,55 +625,32 @@ class Txt2VidNode:
         # Stack all latents for output
         stacked_latents = torch.cat(all_latents, dim=0)
 
-        # At the end of your generate_frames function:
-        h, w = 512, 512  # Force standard dimensions
-        flow_vis = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # Create a simple visualization of the last flow
-        try:
-            last_flow = pred_flow.copy()
-
-            # Ensure flow is exactly the right dimensions
-            last_flow = cv2.resize(last_flow, (w, h))
-
-            # Create a standard flow visualization
-            fx, fy = last_flow[:, :, 0], last_flow[:, :, 1]
-            mag, ang = cv2.cartToPolar(fx, fy)
-
-            # Create HSV visualization
-            hsv = np.zeros((h, w, 3), dtype=np.uint8)
-            hsv[..., 0] = ang * 180 / np.pi / 2
-            hsv[..., 1] = 255
-            hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
-
-            # Convert to RGB
-            flow_vis = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-        except Exception as e:
-            print(f"Error in flow visualization: {e}")
-            # Keep the default black image
-
-        # Convert to tensor
-        #flow_tensor = torch.from_numpy(flow_vis).permute(2, 0, 1).float() / 255.0
-
         # Stack tensors into batches
         flow_batch = torch.stack(flow_visualizations)
-        #occlusion_batch = torch.stack(occlusion_masks)
-        #warped_batch = torch.stack(warped_frames)
-        #blended_batch = torch.stack(blended_frames)
+        occlusion_batch = torch.stack(occlusion_masks)
+        warped_batch = torch.stack(warped_frames)
+        blended_batch = torch.stack(blended_frames)
+
+        # If needed, convert format for ComfyUI compatibility
+        flow_batch = flow_batch.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+        occlusion_batch = occlusion_batch.permute(0, 2, 3, 1)
+        warped_batch = warped_batch.permute(0, 2, 3, 1)
+        blended_batch = blended_batch.permute(0, 2, 3, 1)
+
+        print(f"Flow batch shape: {flow_batch.shape}")
 
         # Clean up
         self.FloweR_clear_memory()
         print("Animation generation complete")
 
-        # Return as a latent dict with debug visualizations
+        # Return all visualizations
         return (
             {"samples": stacked_latents},
-            flow_tensor.unsqueeze(0)
-            #occlusion_tensor.unsqueeze(0),
-            #warped_tensor.unsqueeze(0),
-            #blended_tensor.unsqueeze(0)
+            flow_batch,
+            occlusion_batch,
+            warped_batch,
+            blended_batch
         )
-
 
 # Node class mappings
 NODE_CLASS_MAPPINGS = {
