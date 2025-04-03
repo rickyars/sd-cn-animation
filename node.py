@@ -201,47 +201,6 @@ class Txt2VidNode:
         # Return the modified positive conditioning and original negative conditioning
         return new_positive, negative
 
-    def inpaint_with_mask(self, image_pil, mask_pil, strength, steps, seed, device):
-        """Inpainting using ComfyUI's approach with latent noise mask"""
-        # Get the latent tensor
-        image_latent = self.encode_with_vae(image_pil, self.vae, device)
-
-        # Create latent dictionary with the tensor
-        latent_dict = {"samples": image_latent}
-
-        # Process mask
-        if mask_pil.mode != 'L':
-            mask_pil = mask_pil.convert('L')
-        mask_np = np.array(mask_pil).astype(np.float32) / 255.0
-
-        # Convert to tensor
-        mask_tensor = torch.from_numpy(mask_np).to(device)
-
-        # Add the noise_mask to the latent dict EXACTLY as in SetLatentNoiseMask
-        latent_dict["noise_mask"] = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
-
-        # Generate noise
-        torch.manual_seed(seed)
-        noise = torch.randn_like(image_latent)
-
-        # Sample using standard method
-        import comfy.sample
-        samples = comfy.sample.sample(
-            self.model,
-            noise,
-            steps,
-            self.cfg,
-            self.sampler_name,
-            self.scheduler,
-            self.positive,
-            self.negative,
-            image_latent,
-            denoise=strength,
-            noise_mask=latent_dict["noise_mask"]
-        )
-
-        return {"samples": samples}
-
     def encode_with_vae(self, pil_image, vae, device):
         """Encode PIL image to latent using ComfyUI's approach"""
         # Convert PIL to numpy
@@ -273,24 +232,26 @@ class Txt2VidNode:
 
         return latent
 
-    def sample_diffusion(self, latent, strength, steps, seed):
-        """Sample the diffusion model using ComfyUI's samplers"""
-        # Set random seed
-        torch.manual_seed(seed)
+    def inpaint_with_mask(self, image_pil, mask_pil, strength, steps, seed, device):
+        """Inpainting using ComfyUI's approach with latent noise mask"""
+        # Get the latent tensor
+        image_latent = self.encode_with_vae(image_pil, self.vae, device)
 
-        # Get the device from the latent
-        device = latent["samples"].device
+        # Process mask
+        if mask_pil.mode != 'L':
+            mask_pil = mask_pil.convert('L')
+        mask_np = np.array(mask_pil).astype(np.float32) / 255.0
 
-        # Create noise on the same device
-        noise = torch.randn_like(latent["samples"]).to(device)
+        # Convert to tensor
+        mask_tensor = torch.from_numpy(mask_np).to(device)
 
-        # Create noisy latent
-        if strength > 0:
-            noised_latent = latent["samples"] * (1 - strength) + noise * strength
-        else:
-            noised_latent = latent["samples"]
+        # Add the noise_mask to the latent dict EXACTLY as in SetLatentNoiseMask
+        noise_mask = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
 
-        # Use ComfyUI's sampling method
+        # Generate noise
+        noise = comfy.sample.prepare_noise(image_latent, seed, None)
+
+        # Sample using standard method
         samples = comfy.sample.sample(
             self.model,
             noise,
@@ -300,7 +261,33 @@ class Txt2VidNode:
             self.scheduler,
             self.positive,
             self.negative,
-            noised_latent,
+            image_latent,
+            denoise=strength,
+            noise_mask=noise_mask
+        )
+
+        return {"samples": samples}
+
+    def sample_diffusion(self, latent, strength, steps, seed):
+        """Sample the diffusion model using ComfyUI's samplers"""
+
+        # Get batch indices if available
+        batch_inds = latent.get("batch_index", None)
+
+        # Prepare noise using ComfyUI's method
+        noise = comfy.sample.prepare_noise(latent["samples"], seed, batch_inds)
+
+        # Run the sampler
+        samples = comfy.sample.sample(
+            self.model,
+            noise,
+            steps,
+            self.cfg,
+            self.sampler_name,
+            self.scheduler,
+            self.positive,
+            self.negative,
+            latent["samples"],
             denoise=strength
         )
 
