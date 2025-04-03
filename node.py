@@ -633,7 +633,8 @@ class Txt2VidNode:
                 device
             )
 
-            first_pass_latents.append(inpaint_result["samples"].to(device))
+            first_pass_latent = inpaint_result["samples"]
+            first_pass_latents.append(first_pass_latent.to(device))
 
             # Decode the inpainted result
             inpaint_frame_tensor = vae.decode(inpaint_result["samples"])
@@ -648,39 +649,55 @@ class Txt2VidNode:
 
             # --- Second Pass: Refinement Phase ---
             # Create fresh conditioning for second pass
-            second_pass_positive = positive.copy()
-            second_pass_negative = negative.copy()
+            # For ControlNet application only, decode to pixel space
+            if self.cn_frame_value in [1, 2]:  # If we need pixel-space image for ControlNet
+                # Temporarily decode just for ControlNet
+                inpaint_frame_tensor = vae.decode(first_pass_latent)
+                inpaint_frame = inpaint_frame_tensor[0].cpu()
+                if inpaint_frame.shape[0] == 3:  # [C, H, W]
+                    inpaint_frame_np = inpaint_frame.permute(1, 2, 0).numpy() * 255
+                else:  # Assume [H, W, C]
+                    inpaint_frame_np = inpaint_frame.numpy() * 255
+                inpaint_frame_np = np.clip(inpaint_frame_np, 0, 255).astype(np.uint8)
 
-            # Apply ControlNet for second pass (with potentially different input)
-            if self.cn_frame_value == 1:  # Current Frame (now the inpainted frame)
-                second_pass_positive, second_pass_negative = self.apply_controlnet(
-                    inpaint_frame_np, second_pass_positive, second_pass_negative, control_net,
-                    controlnet_strength, controlnet_start_percent, controlnet_end_percent
-                )
-            elif self.cn_frame_value == 2:  # Previous Frame
-                second_pass_positive, second_pass_negative = self.apply_controlnet(
-                    prev_frame, second_pass_positive, second_pass_negative, control_net,
-                    controlnet_strength, controlnet_start_percent, controlnet_end_percent
-                )
+                # Create fresh conditioning for second pass
+                second_pass_positive = positive.copy()
+                second_pass_negative = negative.copy()
 
-            # Update the conditioning for the second pass
-            self.positive = second_pass_positive
-            self.negative = second_pass_negative
+                # Apply ControlNet for second pass
+                if self.cn_frame_value == 1:  # Current Frame
+                    second_pass_positive, second_pass_negative = self.apply_controlnet(
+                        inpaint_frame_np, second_pass_positive, second_pass_negative, control_net,
+                        controlnet_strength, controlnet_start_percent, controlnet_end_percent
+                    )
+                elif self.cn_frame_value == 2:  # Previous Frame
+                    second_pass_positive, second_pass_negative = self.apply_controlnet(
+                        prev_frame, second_pass_positive, second_pass_negative, control_net,
+                        controlnet_strength, controlnet_start_percent, controlnet_end_percent
+                    )
 
-            # Second diffusion pass - overall refinement (mode 0)
-            fixed_frame_latent = self.encode_with_vae(inpaint_frame_pil, vae, device)
+                # Update the conditioning for the second pass
+                self.positive = second_pass_positive
+                self.negative = second_pass_negative
+            else:
+                # If no ControlNet used, keep original conditioning
+                self.positive = positive.copy()
+                self.negative = negative.copy()
+
+            # Second diffusion pass - using the latent directly from first pass
             fixed_frame_result = self.sample_diffusion(
-                {"samples": fixed_frame_latent},
+                {"samples": first_pass_latent},  # Use direct latent from first pass
                 fix_frame_strength,
                 sampling_steps,
                 frame_seed + 10000
             )
 
             # Store this frame's latent - ensure it's on device
-            second_pass_latents.append(fixed_frame_result["samples"].to(device))
+            second_pass_latent = fixed_frame_result["samples"]
+            second_pass_latents.append(second_pass_latent.to(device))
 
             # Decode for next iteration
-            final_frame_tensor = vae.decode(fixed_frame_result["samples"])
+            final_frame_tensor = vae.decode(second_pass_latent)
             final_frame = final_frame_tensor[0].cpu()
             if final_frame.shape[0] == 3:  # [C, H, W]
                 final_frame_np = final_frame.permute(1, 2, 0).numpy() * 255
@@ -690,6 +707,7 @@ class Txt2VidNode:
             final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
 
             # Match histogram to first frame for consistency
+            '''            
             import skimage.exposure
             final_frame_np = skimage.exposure.match_histograms(
                 final_frame_np,
@@ -697,6 +715,7 @@ class Txt2VidNode:
                 channel_axis=-1
             )
             final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
+            '''
 
             # Update previous frame for next iteration
             prev_frame = final_frame_np.copy()
