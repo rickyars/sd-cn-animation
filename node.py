@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import cv2
 import gc
+import comfy.sample
 from PIL import Image
 
 # Import flow_utils from utils folder
@@ -201,64 +202,30 @@ class Txt2VidNode:
         return new_positive, negative
 
     def inpaint_with_mask(self, image_pil, mask_pil, strength, steps, seed, device):
-        """Perform inpainting on the provided image with the given mask"""
-        import comfy.samplers
-
-        # Make sure mask is in grayscale mode
-        if mask_pil.mode != 'L':
-            mask_pil = mask_pil.convert('L')
-
-        # Apply Gaussian blur to mask if needed
-        if self.occlusion_mask_blur > 0:
-            from PIL import ImageFilter
-            mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(self.occlusion_mask_blur))
-
-        # Adjust mask intensity
-        from PIL import ImageEnhance
-        enhancer = ImageEnhance.Brightness(mask_pil)
-        mask_pil = enhancer.enhance(self.occlusion_mask_multiplier)
-
-        # Ensure the mask is properly thresholded
-        mask_np = np.array(mask_pil)
-        mask_np = np.clip(mask_np, 0, 255).astype(np.uint8)
-        mask_pil = Image.fromarray(mask_np)
-
-        # Convert to latent space
+        """Inpainting using ComfyUI's approach with latent noise mask"""
+        # Get the latent tensor
         image_latent = self.encode_with_vae(image_pil, self.vae, device)
 
-        # Create mask tensor in latent space
+        # Create latent dictionary with the tensor
+        latent_dict = {"samples": image_latent}
+
+        # Process mask
+        if mask_pil.mode != 'L':
+            mask_pil = mask_pil.convert('L')
         mask_np = np.array(mask_pil).astype(np.float32) / 255.0
-        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
 
-        # Resize mask to match latent dimensions
-        from torch.nn.functional import interpolate
-        latent_mask = interpolate(
-            mask_tensor,
-            size=image_latent.shape[2:],
-            mode='bilinear',
-            align_corners=False
-        ).to(device)  # Ensure mask is on the same device as latent
+        # Convert to tensor
+        mask_tensor = torch.from_numpy(mask_np).to(device)
 
-        # Create noise
+        # Add the noise_mask to the latent dict EXACTLY as in SetLatentNoiseMask
+        latent_dict["noise_mask"] = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
+
+        # Generate noise
         torch.manual_seed(seed)
         noise = torch.randn_like(image_latent)
 
-        # Ensure all tensors are on the same device
-        image_latent = image_latent.to(device)
-        latent_mask = latent_mask.to(device)
-        noise = noise.to(device)
-
-        # Create noised image latent for inpainting
-        # This applies noise only to the masked areas
-        # Low strength (e.g., 0.15) will keep more of the original image
-        # High strength (e.g., 0.85) will generate more new content
-        noised_latent = image_latent * (1 - latent_mask) + (
-                    image_latent * (1 - strength) + noise * strength) * latent_mask
-
-        # Sample the diffusion model
-        # For inpainting, we want to use the provided strength directly
-        # Lower values (0.15) preserve more of the original
-        # Higher values (0.85) create more new content
+        # Sample using standard method
+        import comfy.sample
         samples = comfy.sample.sample(
             self.model,
             noise,
@@ -268,8 +235,9 @@ class Txt2VidNode:
             self.scheduler,
             self.positive,
             self.negative,
-            noised_latent,
-            denoise=strength
+            image_latent,
+            denoise=strength,
+            noise_mask=latent_dict["noise_mask"]
         )
 
         return {"samples": samples}
@@ -307,9 +275,6 @@ class Txt2VidNode:
 
     def sample_diffusion(self, latent, strength, steps, seed):
         """Sample the diffusion model using ComfyUI's samplers"""
-        import comfy.samplers
-        import comfy.sample
-
         # Set random seed
         torch.manual_seed(seed)
 
@@ -494,7 +459,7 @@ class Txt2VidNode:
             flow_map[:, :, 0] += np.arange(w)
             flow_map[:, :, 1] += np.arange(h)[:, np.newaxis]
 
-            warped_frame = cv2.remap(prev_frame, flow_map, None, cv2.INTER_LINEAR,
+            warped_frame = cv2.remap(prev_frame, flow_map, None, cv2.INTER_NEAREST,
                                      borderMode=cv2.BORDER_REFLECT_101)
 
             # Blend warped frame with predicted next frame using occlusion mask
