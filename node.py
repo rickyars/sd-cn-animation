@@ -35,6 +35,10 @@ class Txt2VidNode:
                 "cn_frame_send": (["None", "Current Frame", "Previous Frame"], {
                     "default": "Previous Frame",
                 }),
+                "tile_preprocessor": (["Basic", "ColorFix"], {
+                    "default": "ColorFix",
+                    "label": "Tile Preprocessor Type"
+                }),
                 "controlnet_strength": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
@@ -160,10 +164,99 @@ class Txt2VidNode:
         self.FloweR_model = self.FloweR_model.to(self.DEVICE)
         self.FloweR_model.eval()
 
+    def is_tile_controlnet(self, controlnet_name):
+        """Check if the ControlNet model is a tile type"""
+        # Common identifiers in tile model filenames
+        tile_identifiers = ["_tile", "tile_", "sd15_tile"]
+
+        if controlnet_name is None:
+            return False
+
+        # Convert to string if it's not already
+        if not isinstance(controlnet_name, str):
+            # If it's an object with a name or filename attribute, try to use that
+            if hasattr(controlnet_name, 'name'):
+                controlnet_name = controlnet_name.name
+            elif hasattr(controlnet_name, 'filename'):
+                controlnet_name = controlnet_name.filename
+            else:
+                # If we can't determine the name, assume it's not a tile model
+                return False
+
+        # Check if any of the identifiers are in the name
+        return any(identifier in controlnet_name.lower() for identifier in tile_identifiers)
+
+    def tile_basic_preprocessor(self, image, blur_strength=5.0):
+        """
+        Basic tile preprocessor (tile_resample equivalent)
+        Applies Gaussian blur to the image
+        """
+        import cv2
+        import numpy as np
+
+        # Ensure image is numpy array
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+
+        # Make a copy to avoid modifying the original
+        result = image.copy()
+
+        # Apply Gaussian blur - key for tile preprocessor
+        if blur_strength > 0:
+            # Calculate kernel size based on blur strength (must be odd)
+            kernel_size = max(3, int(blur_strength * 2)) | 1  # Ensure odd number
+            result = cv2.GaussianBlur(result, (kernel_size, kernel_size), 0)
+
+        return result
+
+    def tile_colorfix_preprocessor(self, image, blur_strength=5.0):
+        """
+        Enhanced tile preprocessor with color preservation (tile_colorfix equivalent)
+        """
+        import cv2
+        import numpy as np
+
+        # Ensure image is numpy array
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+
+        # Make a copy to avoid modifying the original
+        img_copy = image.copy()
+
+        # Convert to LAB color space to preserve colors while blurring
+        # LAB separates luminance from color information
+        lab = cv2.cvtColor(img_copy, cv2.COLOR_RGB2LAB)
+
+        # Split channels
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        # Only blur the L (luminance) channel
+        if blur_strength > 0:
+            kernel_size = max(3, int(blur_strength * 2)) | 1  # Ensure odd number
+            l_channel = cv2.GaussianBlur(l_channel, (kernel_size, kernel_size), 0)
+
+        # Merge channels back
+        lab = cv2.merge([l_channel, a_channel, b_channel])
+
+        # Convert back to RGB
+        result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+        return result
+
     def apply_controlnet(self, img_np, positive, negative, control_net, strength, start_percent=0.0, end_percent=1.0):
         """Apply ControlNet to conditioning based on an image"""
-        if control_net is None or img_np is None:
+        if control_net is None or img_np is None or strength == 0:
             return positive, negative
+
+        # Check if this is a tile controlnet model and apply preprocessing if needed
+        if self.is_tile_controlnet(control_net):
+            print(f"Detected tile ControlNet, applying {self.tile_preprocessor} preprocessing...")
+
+            # Apply the selected tile preprocessor
+            if self.tile_preprocessor == "ColorFix":
+                img_np = self.tile_colorfix_preprocessor(img_np, blur_strength=self.occlusion_mask_blur)
+            else:  # Basic
+                img_np = self.tile_basic_preprocessor(img_np, blur_strength=self.occlusion_mask_blur)
 
         # Convert numpy array to tensor in the format expected by ControlNet
         img_tensor = torch.from_numpy(img_np).float() / 255.0
@@ -171,34 +264,47 @@ class Txt2VidNode:
             img_tensor = img_tensor.permute(2, 0, 1)  # Convert to [C, H, W]
         img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension [1, C, H, W]
 
-        # Get the device - in ComfyUI, we need to check model components
+        # Get the device
         target_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Alternative ways to get device in ComfyUI:
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
             target_device = self.model.model.device
-        elif hasattr(self.model, 'first_stage_model') and hasattr(self.model.first_stage_model, 'device'):
-            target_device = self.model.first_stage_model.device
 
         img_tensor = img_tensor.to(target_device)
 
-        # Create a copy of the controlnet to avoid modifying the original
-        cn_copy = control_net.copy()
+        # Prepare control hint - move channels dimension to position 1 as expected
+        control_hint = img_tensor.movedim(-1, 1) if img_tensor.dim() == 4 and img_tensor.shape[-1] in [1, 3,
+                                                                                                       4] else img_tensor
 
-        # Set the conditioning hint
-        cn_copy.cond_hint_original = img_tensor
-        cn_copy.strength = strength
-        cn_copy.start_percent = start_percent
-        cn_copy.end_percent = end_percent
-
-        # Apply to positive conditioning only
+        # Create new conditioning list
         new_positive = []
-        for t in positive:
-            d = t[1].copy()
-            d['control'] = cn_copy  # Attach the ControlNet object directly
-            d['control_apply_to_uncond'] = False
-            new_positive.append([t[0], d])
 
-        # Return the modified positive conditioning and original negative conditioning
+        # Process each conditioning item
+        for t in positive:
+            # Create a new conditioning entry with a copy of the cond dict
+            n = [t[0], t[1].copy()]
+
+            # Create a copy of the control_net and set the conditioning hint and strength
+            # Note: In your implementation, you'll need to adapt this based on your control_net object structure
+            c_net = control_net.copy()
+
+            # Set the conditioning hint (image), strength, and timestep range
+            c_net.cond_hint_original = control_hint
+            c_net.strength = strength
+            c_net.timestep_percent_range = (start_percent, end_percent)
+
+            # Link to previous controlnet if one exists
+            if 'control' in t[1]:
+                c_net.previous_controlnet = t[1]['control']
+
+            # Set the control net in the conditioning
+            n[1]['control'] = c_net
+
+            # Apply to uncond (negative prompt) as well
+            n[1]['control_apply_to_uncond'] = True
+
+            # Add to the new conditioning list
+            new_positive.append(n)
+
         return new_positive, negative
 
     def encode_with_vae(self, pil_image, vae, device):
@@ -318,7 +424,7 @@ class Txt2VidNode:
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         sampling_steps, cfg, sampler_name, scheduler, processing_strength, fix_frame_strength,
                         occlusion_mask_blur, occlusion_mask_multiplier, occlusion_flow_multiplier,
-                        occlusion_difo_multiplier, occlusion_difs_multiplier, seed):
+                        occlusion_difo_multiplier, occlusion_difs_multiplier, seed, tile_preprocessor):
         """Generate a sequence of latent frames with iterative diffusion"""
         # Store model and conditioning for internal use
         self.model = model
@@ -333,6 +439,9 @@ class Txt2VidNode:
         self.occlusion_flow_multiplier = occlusion_flow_multiplier
         self.occlusion_difo_multiplier = occlusion_difo_multiplier
         self.occlusion_difs_multiplier = occlusion_difs_multiplier
+
+        # Store the selected tile preprocessor type
+        self.tile_preprocessor = tile_preprocessor
 
         # Initialize collections for debug visualizations
         flow_visualizations = []
@@ -485,30 +594,40 @@ class Txt2VidNode:
             # Get grayscale occlusion for inpainting
             pred_occl_gray = np.mean(pred_occl, axis=2).astype(np.uint8)
 
-            # Before first inpainting pass
+            # IMPORTANT: Create new conditioning for each pass instead of modifying the same one
+            # This prevents ControlNet effects from compounding
+
+            # --- First Pass: Inpainting Phase ---
+            # Create fresh conditioning for first pass
+            first_pass_positive = positive.copy()
+            first_pass_negative = negative.copy()
+
+            # Apply ControlNet for first pass
             if self.cn_frame_value == 1:  # Current Frame
-                self.positive, self.negative = self.apply_controlnet(
-                    pred_next, positive, negative, control_net,
+                first_pass_positive, first_pass_negative = self.apply_controlnet(
+                    pred_next, first_pass_positive, first_pass_negative, control_net,
                     controlnet_strength, controlnet_start_percent, controlnet_end_percent
                 )
             elif self.cn_frame_value == 2:  # Previous Frame
-                self.positive, self.negative = self.apply_controlnet(
-                    prev_frame, positive, negative, control_net,
+                first_pass_positive, first_pass_negative = self.apply_controlnet(
+                    prev_frame, first_pass_positive, first_pass_negative, control_net,
                     controlnet_strength, controlnet_start_percent, controlnet_end_percent
                 )
+
+            # Store the current positive/negative for inpainting
+            self.positive = first_pass_positive
+            self.negative = first_pass_negative
 
             # Convert to PIL for inpainting
             pred_next_pil = Image.fromarray(pred_next)
             pred_occl_pil = Image.fromarray(pred_occl_gray)
 
             # First diffusion pass - focusing on occluded areas (mode 4)
-            # This properly recreates the inpainting approach from the original code
-            # processing_strength controls how much to regenerate in masked areas
             frame_seed = seed + i if seed != 0 else i
             inpaint_result = self.inpaint_with_mask(
                 pred_next_pil,
                 pred_occl_pil,
-                processing_strength,  # Use the user-provided value directly
+                processing_strength,
                 sampling_steps,
                 frame_seed,
                 device
@@ -516,7 +635,7 @@ class Txt2VidNode:
 
             first_pass_latents.append(inpaint_result["samples"].to(device))
 
-            # Decode the inpainted result for visualization and next step
+            # Decode the inpainted result
             inpaint_frame_tensor = vae.decode(inpaint_result["samples"])
             inpaint_frame = inpaint_frame_tensor[0].cpu()
             if inpaint_frame.shape[0] == 3:  # [C, H, W]
@@ -525,29 +644,34 @@ class Txt2VidNode:
                 inpaint_frame_np = inpaint_frame.numpy() * 255
 
             inpaint_frame_np = np.clip(inpaint_frame_np, 0, 255).astype(np.uint8)
-
-            # Convert back to PIL for second pass
             inpaint_frame_pil = Image.fromarray(inpaint_frame_np)
 
-            # Get the frame for the second pass ControlNet application
-            if self.cn_frame_value == 1:  # Current Frame
-                self.positive, self.negative = self.apply_controlnet(
-                    inpaint_frame_np, positive, negative, control_net,
+            # --- Second Pass: Refinement Phase ---
+            # Create fresh conditioning for second pass
+            second_pass_positive = positive.copy()
+            second_pass_negative = negative.copy()
+
+            # Apply ControlNet for second pass (with potentially different input)
+            if self.cn_frame_value == 1:  # Current Frame (now the inpainted frame)
+                second_pass_positive, second_pass_negative = self.apply_controlnet(
+                    inpaint_frame_np, second_pass_positive, second_pass_negative, control_net,
                     controlnet_strength, controlnet_start_percent, controlnet_end_percent
                 )
-            elif self.cn_frame_value == 2:  # Previous Frame (still the same as before)
-                self.positive, self.negative = self.apply_controlnet(
-                    prev_frame, positive, negative, control_net,
+            elif self.cn_frame_value == 2:  # Previous Frame
+                second_pass_positive, second_pass_negative = self.apply_controlnet(
+                    prev_frame, second_pass_positive, second_pass_negative, control_net,
                     controlnet_strength, controlnet_start_percent, controlnet_end_percent
                 )
 
+            # Update the conditioning for the second pass
+            self.positive = second_pass_positive
+            self.negative = second_pass_negative
+
             # Second diffusion pass - overall refinement (mode 0)
-            # Apply the fix_frame_strength to the entire frame without a mask
-            # fix_frame_strength should be low (e.g., 0.15) to maintain consistency
             fixed_frame_latent = self.encode_with_vae(inpaint_frame_pil, vae, device)
             fixed_frame_result = self.sample_diffusion(
                 {"samples": fixed_frame_latent},
-                fix_frame_strength,  # Use the user-provided value directly
+                fix_frame_strength,
                 sampling_steps,
                 frame_seed + 10000
             )
