@@ -35,9 +35,16 @@ class Txt2VidNode:
                 "cn_frame_send": (["None", "Current Frame", "Previous Frame"], {
                     "default": "Previous Frame",
                 }),
-                "tile_preprocessor": (["Basic", "ColorFix"], {
+                "tile_preprocessor": (["None", "Basic", "ColorFix"], {
                     "default": "ColorFix",
                     "label": "Tile Preprocessor Type"
+                }),
+                "tile_blur_strength": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0.0,
+                    "max": 25.0,
+                    "step": 0.1,
+                    "label": "Tile Preprocessor Blur"
                 }),
                 "controlnet_strength": ("FLOAT", {
                     "default": 1.0,
@@ -74,13 +81,13 @@ class Txt2VidNode:
                                   "dpmpp_sde", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde", "ddim"],),
                 "scheduler": (["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform"],),
                 "processing_strength": ("FLOAT", {
-                    "default": 0.35,
+                    "default": 0.85,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.01
                 }),
                 "fix_frame_strength": ("FLOAT", {
-                    "default": 0.35,
+                    "default": 0.15,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.01
@@ -123,8 +130,9 @@ class Txt2VidNode:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("first_pass_frames", "second_pass_frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
+    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("first_pass_frames", "second_pass_frames", "flow_visualization", "occlusion_mask",
+                    "warped_frame", "blended_frame", "preprocessed_controlnet_input")
     FUNCTION = "generate_frames"
     CATEGORY = "animation"
 
@@ -163,28 +171,6 @@ class Txt2VidNode:
         self.FloweR_model.load_state_dict(torch.load(model_path, map_location=self.DEVICE))
         self.FloweR_model = self.FloweR_model.to(self.DEVICE)
         self.FloweR_model.eval()
-
-    def is_tile_controlnet(self, controlnet_name):
-        """Check if the ControlNet model is a tile type"""
-        # Common identifiers in tile model filenames
-        tile_identifiers = ["_tile", "tile_", "sd15_tile"]
-
-        if controlnet_name is None:
-            return False
-
-        # Convert to string if it's not already
-        if not isinstance(controlnet_name, str):
-            # If it's an object with a name or filename attribute, try to use that
-            if hasattr(controlnet_name, 'name'):
-                controlnet_name = controlnet_name.name
-            elif hasattr(controlnet_name, 'filename'):
-                controlnet_name = controlnet_name.filename
-            else:
-                # If we can't determine the name, assume it's not a tile model
-                return False
-
-        # Check if any of the identifiers are in the name
-        return any(identifier in controlnet_name.lower() for identifier in tile_identifiers)
 
     def tile_basic_preprocessor(self, image, blur_strength=5.0):
         """
@@ -243,23 +229,40 @@ class Txt2VidNode:
 
         return result
 
-    def apply_controlnet(self, img_np, positive, negative, control_net, strength, start_percent=0.0, end_percent=1.0):
+    def apply_controlnet(self, img_np, positive, negative, control_net, strength,
+                         start_percent=0.0, end_percent=1.0, preprocessing_step="unknown"):
         """Apply ControlNet to conditioning based on an image"""
         if control_net is None or img_np is None or strength == 0:
-            return positive, negative
+            print(f"[{preprocessing_step}] Skipping ControlNet: None or strength=0")
+            return positive, negative, None
 
-        # Check if this is a tile controlnet model and apply preprocessing if needed
-        if self.is_tile_controlnet(control_net):
-            print(f"Detected tile ControlNet, applying {self.tile_preprocessor} preprocessing...")
+        # Make a copy of the image to avoid modifying the original
+        img_processed = img_np.copy()
+
+        # Apply tile preprocessing if enabled
+        if self.tile_preprocessor != "None":
+            print(
+                f"[{preprocessing_step}] Applying {self.tile_preprocessor} preprocessing with blur={self.tile_blur_strength}")
 
             # Apply the selected tile preprocessor
             if self.tile_preprocessor == "ColorFix":
-                img_np = self.tile_colorfix_preprocessor(img_np, blur_strength=self.occlusion_mask_blur)
-            else:  # Basic
-                img_np = self.tile_basic_preprocessor(img_np, blur_strength=self.occlusion_mask_blur)
+                img_processed = self.tile_colorfix_preprocessor(
+                    img_processed,
+                    blur_strength=self.tile_blur_strength
+                )
+            elif self.tile_preprocessor == "Basic":
+                img_processed = self.tile_basic_preprocessor(
+                    img_processed,
+                    blur_strength=self.tile_blur_strength
+                )
+        else:
+            print(f"[{preprocessing_step}] No preprocessing applied (set to None)")
+
+        # Keep processed for return
+        processed_for_return = img_processed.copy()
 
         # Convert numpy array to tensor in the format expected by ControlNet
-        img_tensor = torch.from_numpy(img_np).float() / 255.0
+        img_tensor = torch.from_numpy(img_processed).float() / 255.0
         if len(img_tensor.shape) == 3 and img_tensor.shape[2] == 3:  # [H, W, C]
             img_tensor = img_tensor.permute(2, 0, 1)  # Convert to [C, H, W]
         img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension [1, C, H, W]
@@ -284,7 +287,6 @@ class Txt2VidNode:
             n = [t[0], t[1].copy()]
 
             # Create a copy of the control_net and set the conditioning hint and strength
-            # Note: In your implementation, you'll need to adapt this based on your control_net object structure
             c_net = control_net.copy()
 
             # Set the conditioning hint (image), strength, and timestep range
@@ -305,36 +307,19 @@ class Txt2VidNode:
             # Add to the new conditioning list
             new_positive.append(n)
 
-        return new_positive, negative
+        return new_positive, negative, processed_for_return
 
     def encode_with_vae(self, pil_image, vae, device):
-        """Encode PIL image to latent using ComfyUI's approach"""
+        """Simplified VAE encoding function for PIL images"""
         # Convert PIL to numpy
         img = np.array(pil_image.convert("RGB")).astype(np.float32) / 255.0
 
-        # Create tensor with correct shape
-        img_tensor = torch.from_numpy(img)
+        # Convert to tensor with batch dimension
+        img_tensor = torch.from_numpy(img).unsqueeze(0).to(device)
 
-        # Move to device
-        img_tensor = img_tensor.to(device)
-
-        # Ensure dimensions are multiples of 8
-        h, w = img_tensor.shape[0], img_tensor.shape[1]
-        x = (w // 8) * 8
-        y = (h // 8) * 8
-
-        # Crop if necessary
-        if w != x or h != y:
-            x_offset = (w % 8) // 2
-            y_offset = (h % 8) // 2
-            img_tensor = img_tensor[y_offset:y + y_offset, x_offset:x + x_offset, :]
-
-        # Add batch dimension
-        pixels = img_tensor.unsqueeze(0)
-
-        # Encode with VAE (only using RGB channels)
+        # Encode with VAE
         with torch.no_grad():
-            latent = vae.encode(pixels[:, :, :, :3])
+            latent = vae.encode(img_tensor)
 
         return latent
 
@@ -424,7 +409,8 @@ class Txt2VidNode:
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         sampling_steps, cfg, sampler_name, scheduler, processing_strength, fix_frame_strength,
                         occlusion_mask_blur, occlusion_mask_multiplier, occlusion_flow_multiplier,
-                        occlusion_difo_multiplier, occlusion_difs_multiplier, seed, tile_preprocessor):
+                        occlusion_difo_multiplier, occlusion_difs_multiplier, seed, tile_preprocessor,
+                        tile_blur_strength):
         """Generate a sequence of latent frames with iterative diffusion"""
         # Store model and conditioning for internal use
         self.model = model
@@ -442,12 +428,14 @@ class Txt2VidNode:
 
         # Store the selected tile preprocessor type
         self.tile_preprocessor = tile_preprocessor
+        self.tile_blur_strength = tile_blur_strength
 
         # Initialize collections for debug visualizations
         flow_visualizations = []
         occlusion_masks = []
         warped_frames = []
         blended_frames = []
+        preprocessed_controlnet_inputs = []
 
         # Convert cn_frame_send string to numeric value
         cn_frame_options = ["None", "Current Frame", "Previous Frame"]
@@ -604,15 +592,28 @@ class Txt2VidNode:
 
             # Apply ControlNet for first pass
             if self.cn_frame_value == 1:  # Current Frame
-                first_pass_positive, first_pass_negative = self.apply_controlnet(
+                first_pass_positive, first_pass_negative, proc_img = self.apply_controlnet(
                     pred_next, first_pass_positive, first_pass_negative, control_net,
-                    controlnet_strength, controlnet_start_percent, controlnet_end_percent
+                    controlnet_strength, controlnet_start_percent, controlnet_end_percent,
+                    preprocessing_step="first_pass_current"
                 )
+                if proc_img is not None:
+                    # Resize to match other output images if needed
+                    proc_img = cv2.resize(proc_img, (target_w, target_h))
+                    # Convert to tensor in the format expected by ComfyUI
+                    proc_tensor = torch.from_numpy(proc_img).permute(2, 0, 1).float() / 255.0
+                    # Add to the collection
+                    preprocessed_controlnet_inputs.append(proc_tensor)
             elif self.cn_frame_value == 2:  # Previous Frame
-                first_pass_positive, first_pass_negative = self.apply_controlnet(
+                first_pass_positive, first_pass_negative, proc_img = self.apply_controlnet(
                     prev_frame, first_pass_positive, first_pass_negative, control_net,
-                    controlnet_strength, controlnet_start_percent, controlnet_end_percent
+                    controlnet_strength, controlnet_start_percent, controlnet_end_percent,
+                    preprocessing_step="first_pass_previous"
                 )
+                if proc_img is not None:
+                    proc_img = cv2.resize(proc_img, (target_w, target_h))
+                    proc_tensor = torch.from_numpy(proc_img).permute(2, 0, 1).float() / 255.0
+                    preprocessed_controlnet_inputs.append(proc_tensor)
 
             # Store the current positive/negative for inpainting
             self.positive = first_pass_positive
@@ -635,54 +636,6 @@ class Txt2VidNode:
 
             first_pass_latent = inpaint_result["samples"]
             first_pass_latents.append(first_pass_latent.to(device))
-
-            # Decode the inpainted result
-            inpaint_frame_tensor = vae.decode(inpaint_result["samples"])
-            inpaint_frame = inpaint_frame_tensor[0].cpu()
-            if inpaint_frame.shape[0] == 3:  # [C, H, W]
-                inpaint_frame_np = inpaint_frame.permute(1, 2, 0).numpy() * 255
-            else:  # Assume [H, W, C]
-                inpaint_frame_np = inpaint_frame.numpy() * 255
-
-            inpaint_frame_np = np.clip(inpaint_frame_np, 0, 255).astype(np.uint8)
-            inpaint_frame_pil = Image.fromarray(inpaint_frame_np)
-
-            # --- Second Pass: Refinement Phase ---
-            # Create fresh conditioning for second pass
-            # For ControlNet application only, decode to pixel space
-            if self.cn_frame_value in [1, 2]:  # If we need pixel-space image for ControlNet
-                # Temporarily decode just for ControlNet
-                inpaint_frame_tensor = vae.decode(first_pass_latent)
-                inpaint_frame = inpaint_frame_tensor[0].cpu()
-                if inpaint_frame.shape[0] == 3:  # [C, H, W]
-                    inpaint_frame_np = inpaint_frame.permute(1, 2, 0).numpy() * 255
-                else:  # Assume [H, W, C]
-                    inpaint_frame_np = inpaint_frame.numpy() * 255
-                inpaint_frame_np = np.clip(inpaint_frame_np, 0, 255).astype(np.uint8)
-
-                # Create fresh conditioning for second pass
-                second_pass_positive = positive.copy()
-                second_pass_negative = negative.copy()
-
-                # Apply ControlNet for second pass
-                if self.cn_frame_value == 1:  # Current Frame
-                    second_pass_positive, second_pass_negative = self.apply_controlnet(
-                        inpaint_frame_np, second_pass_positive, second_pass_negative, control_net,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent
-                    )
-                elif self.cn_frame_value == 2:  # Previous Frame
-                    second_pass_positive, second_pass_negative = self.apply_controlnet(
-                        prev_frame, second_pass_positive, second_pass_negative, control_net,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent
-                    )
-
-                # Update the conditioning for the second pass
-                self.positive = second_pass_positive
-                self.negative = second_pass_negative
-            else:
-                # If no ControlNet used, keep original conditioning
-                self.positive = positive.copy()
-                self.negative = negative.copy()
 
             # Second diffusion pass - using the latent directly from first pass
             fixed_frame_result = self.sample_diffusion(
@@ -736,6 +689,15 @@ class Txt2VidNode:
         warped_batch = warped_batch.permute(0, 2, 3, 1)
         blended_batch = blended_batch.permute(0, 2, 3, 1)
 
+        # Add placeholder if no ControlNet was applied
+        if len(preprocessed_controlnet_inputs) == 0:
+            placeholder = torch.zeros_like(flow_visualizations[0])
+            preprocessed_controlnet_inputs.append(placeholder)
+
+        # At the end of generate_frames, prepare the tensor for output:
+        proc_batch = torch.stack(preprocessed_controlnet_inputs)
+        proc_batch = proc_batch.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+
         print(f"Flow batch shape: {flow_batch.shape}")
 
         # Clean up
@@ -749,7 +711,8 @@ class Txt2VidNode:
             flow_batch,
             occlusion_batch,
             warped_batch,
-            blended_batch
+            blended_batch,
+            proc_batch
         )
 
 # Node class mappings
