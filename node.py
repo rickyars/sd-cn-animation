@@ -384,6 +384,48 @@ class Txt2VidNode:
 
         return {"samples": samples}
 
+    def limit_saturation(self, image, max_saturation=160):
+        """
+        Prevents oversaturation by capping saturation values in HSV color space.
+
+        Args:
+            image: RGB numpy array image
+            max_saturation: Maximum saturation value (0-255)
+
+        Returns:
+            RGB image with limited saturation
+        """
+        import cv2
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, max_saturation)
+        return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    def apply_histogram_matching(self, image, reference, strength=1.0):
+        """
+        Matches the color distribution of an image to a reference image.
+
+        Args:
+            image: Source RGB numpy array image
+            reference: Reference RGB numpy array image
+            strength: Blending factor (0.0 = no effect, 1.0 = full matching)
+
+        Returns:
+            Color-matched RGB image
+        """
+        import skimage.exposure
+        # Apply full histogram matching
+        matched = skimage.exposure.match_histograms(
+            image, reference, channel_axis=-1
+        )
+
+        # Blend between original and matched based on strength
+        if strength < 1.0:
+            result = (image * (1 - strength) + matched * strength).astype(np.float32)
+            result = np.clip(result, 0, 255).astype(np.uint8)
+            return result
+        else:
+            return matched
+
     def create_flow_visualization(self, flow):
         """Create a color-coded visualization of optical flow"""
         # Calculate flow magnitude and angle
@@ -657,18 +699,19 @@ class Txt2VidNode:
             else:  # Assume [H, W, C]
                 final_frame_np = final_frame.numpy() * 255
 
+            # Apply color correction techniques
             final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
 
-            # Match histogram to first frame for consistency
-            '''            
-            import skimage.exposure
-            final_frame_np = skimage.exposure.match_histograms(
+            # First limit extreme saturation values to prevent color blowout
+            final_frame_np = self.limit_saturation(final_frame_np, max_saturation=160)
+
+            # Then apply partial histogram matching to maintain consistency
+            # Use a moderate strength (0.7) to balance between color accuracy and consistency
+            final_frame_np = self.apply_histogram_matching(
                 final_frame_np,
                 init_frame_np,
-                channel_axis=-1
+                strength=0.7  # Adjust this value as needed (0.0-1.0)
             )
-            final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
-            '''
 
             # Update previous frame for next iteration
             prev_frame = final_frame_np.copy()
