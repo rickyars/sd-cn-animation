@@ -95,31 +95,31 @@ class Txt2VidNode:
                 "occlusion_mask_blur": ("FLOAT", {
                     "default": 5.0,
                     "min": 0.0,
-                    "max": 50.0,
+                    "max": 100.0,
                     "step": 0.1
                 }),
                 "occlusion_mask_multiplier": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.1,
-                    "max": 10.0,
+                    "default": 5.0,
+                    "min": 0.0,
+                    "max": 100.0,
                     "step": 0.1
                 }),
                 "occlusion_flow_multiplier": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
-                    "max": 10.0,
+                    "max": 100.0,
                     "step": 0.1
                 }),
                 "occlusion_difo_multiplier": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
-                    "max": 10.0,
+                    "max": 100.0,
                     "step": 0.1
                 }),
                 "occlusion_difs_multiplier": ("FLOAT", {
-                    "default": 1.0,
+                    "default": 2.0,
                     "min": 0.0,
-                    "max": 10.0,
+                    "max": 100.0,
                     "step": 0.1
                 }),
                 "seed": ("INT", {
@@ -560,6 +560,9 @@ class Txt2VidNode:
 
             # Apply multipliers to flow and occlusion
             pred_flow = pred_flow * self.occlusion_flow_multiplier
+
+            # Generatl multiplier for teh occlusion mask
+            pred_occl = np.clip(pred_occl * self.occlusion_mask_multiplier, 0, 255).astype(np.uint8)
 
             # Additional processing for flow
             flow_magnitude = np.linalg.norm(pred_flow, axis=-1, keepdims=True)
