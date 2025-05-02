@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import cv2
 from PIL import Image
+from comfy.utils import ProgressBar
 
 from .components import (
     FloweRHandler,
@@ -238,6 +239,9 @@ class Txt2VidNode:
         warped_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
         blended_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
 
+        # Initialize progress tracking
+        pbar = ProgressBar(num_frames)
+
         # === STEP 3: Generate the sequence ===
         print(f"Generating {num_frames} frames")
         for i in range(num_frames - 1):
@@ -373,6 +377,9 @@ class Txt2VidNode:
 
             # Update previous frame for next iteration
             prev_frame = final_frame_np.copy()
+
+            # Update progress
+            pbar.update(1)
 
         # === STEP 9: Prepare output tensors ===
         # Stack all latents for output
