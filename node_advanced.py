@@ -1,11 +1,12 @@
 """
-Main node implementation for SD-CN Animation.
-Now uses modular components for better organization.
+Advanced node implementation for SD-CN Animation.
+Takes direct inputs for samplers, sigmas, etc. for more control.
 """
 import torch
 import numpy as np
 import cv2
 from PIL import Image
+import comfy.utils
 from comfy.utils import ProgressBar
 
 from .components import (
@@ -18,10 +19,11 @@ from .components import (
 from .utils import latent_utils
 
 
-class Txt2VidNode:
+class Txt2VidNodeAdvanced:
     """
-    Text to Video node for ComfyUI
+    Advanced Text to Video node for ComfyUI
     Generates video frames from an initial image using text prompts and ControlNet
+    With direct control over samplers and sigmas
     """
 
     def __init__(self):
@@ -40,31 +42,19 @@ class Txt2VidNode:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MODEL",),  # Diffusion model
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
-                "latent": ("LATENT",),  # Initial latent
+                # Direct inputs for advanced sampling control
+                "noise": ("NOISE",),
+                "guider": ("GUIDER",),
+                "sampler": ("SAMPLER",),
+                "first_pass_sigmas": ("SIGMAS",),
+                "second_pass_sigmas": ("SIGMAS",),
+                "latent": ("LATENT",),
                 "vae": ("VAE",),
-                "control_net": ("CONTROL_NET",),  # Keep ControlNet input
-                "num_frames": ("INT", {
-                    "default": 16,
-                    "min": 2,
-                    "max": 1000,
-                    "step": 1
-                }),
+
+                # ControlNet inputs - identical to original node
+                "control_net": ("CONTROL_NET",),
                 "cn_frame_send": (["None", "Current Frame", "Previous Frame"], {
                     "default": "Previous Frame",
-                }),
-                "tile_preprocessor": (["None", "Basic", "ColorFix"], {
-                    "default": "ColorFix",
-                    "label": "Tile Preprocessor Type"
-                }),
-                "tile_blur_strength": ("FLOAT", {
-                    "default": 5.0,
-                    "min": 0.0,
-                    "max": 25.0,
-                    "step": 0.1,
-                    "label": "Tile Preprocessor Blur"
                 }),
                 "controlnet_strength": ("FLOAT", {
                     "default": 1.0,
@@ -84,33 +74,24 @@ class Txt2VidNode:
                     "max": 1.0,
                     "step": 0.01
                 }),
-                "sampling_steps": ("INT", {
-                    "default": 20,
-                    "min": 1,
-                    "max": 150,
+
+                # Animation parameters - identical to original node
+                "num_frames": ("INT", {
+                    "default": 16,
+                    "min": 2,
+                    "max": 1000,
                     "step": 1
                 }),
-                "cfg": ("FLOAT", {
-                    "default": 7.0,
-                    "min": 1.0,
-                    "max": 30.0,
-                    "step": 0.1
+                "tile_preprocessor": (["None", "Basic", "ColorFix"], {
+                    "default": "ColorFix",
+                    "label": "Tile Preprocessor Type"
                 }),
-                "sampler_name": (["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral",
-                                  "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral",
-                                  "dpmpp_sde", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde", "ddim"],),
-                "scheduler": (["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform"],),
-                "processing_strength": ("FLOAT", {
-                    "default": 0.85,
+                "tile_blur_strength": ("FLOAT", {
+                    "default": 5.0,
                     "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01
-                }),
-                "fix_frame_strength": ("FLOAT", {
-                    "default": 0.15,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01
+                    "max": 25.0,
+                    "step": 0.1,
+                    "label": "Tile Preprocessor Blur"
                 }),
                 "occlusion_mask_blur": ("FLOAT", {
                     "default": 5.0,
@@ -150,30 +131,34 @@ class Txt2VidNode:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
     RETURN_NAMES = ("first_pass_frames", "second_pass_frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
-    FUNCTION = "generate_frames"
+    FUNCTION = "generate_frames_advanced"
     CATEGORY = "animation"
 
-    def generate_frames(self, model, positive, negative, latent, vae, control_net, num_frames, cn_frame_send,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent,
-                        sampling_steps, cfg, sampler_name, scheduler, processing_strength, fix_frame_strength,
-                        occlusion_mask_blur, occlusion_mask_multiplier, occlusion_flow_multiplier,
-                        occlusion_difo_multiplier, occlusion_difs_multiplier, seed, tile_preprocessor, tile_blur_strength):
+    def generate_frames_advanced(self, noise, guider, sampler, first_pass_sigmas, second_pass_sigmas,
+                               latent, vae, control_net, cn_frame_send, controlnet_strength,
+                               controlnet_start_percent, controlnet_end_percent,
+                               num_frames, tile_preprocessor, tile_blur_strength,
+                               occlusion_mask_blur, occlusion_mask_multiplier, occlusion_flow_multiplier,
+                               occlusion_difo_multiplier, occlusion_difs_multiplier, seed):
         """
         Generate a sequence of latent frames with iterative diffusion
+        Using direct control over samplers and sigma schedules
 
         Args:
             All parameters from the node interface
 
         Returns:
             Tuple of (first_pass_latents, second_pass_latents, flow_visualization, occlusion_mask,
-                     warped_frame, blended_frame, preprocessed_controlnet_input)
+                    warped_frame, blended_frame, preprocessed_controlnet_input)
         """
-        # Initialize component parameters
-        self.diffusion.set_model_params(
-            model, vae, positive, negative, cfg, sampler_name, scheduler
-        )
+        # Extract model from the guider
+        model = guider.model_patcher
+
+        # Initialize diffusion handler with the VAE
+        self.diffusion.model = model
+        self.diffusion.vae = vae
 
         self.controlnet.set_preprocessor(
             tile_preprocessor, tile_blur_strength
@@ -294,67 +279,120 @@ class Txt2VidNode:
             pred_next = blended_frame
 
             # === STEP 5: Apply ControlNet based on settings ===
-            # Create fresh conditioning for first pass
-            first_pass_positive = positive.copy()
-            first_pass_negative = negative.copy()
+            sampling_guider = guider  # Default to original guider
 
             # Only apply ControlNet if it exists and strength > 0
             if control_net is not None and controlnet_strength > 0:
-                # Apply ControlNet for first pass depending on settings
+                # Get current conditioning from guider
+                positive_cond = guider.positive_cond
+                negative_cond = guider.negative_cond
+
+                # Apply ControlNet based on settings
                 if self.cn_frame_value == 1:  # Current Frame
-                    first_pass_positive, first_pass_negative, proc_img = self.controlnet.apply_controlnet(
-                        pred_next, first_pass_positive, first_pass_negative, control_net,
+                    modified_positive, _, proc_img = self.controlnet.apply_controlnet(
+                        pred_next, positive_cond, negative_cond, control_net,
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         preprocessing_step="first_pass_current"
                     )
+
+                    # Create a new guider with the modified conditioning
+                    # We need to copy the original guider's settings
+                    new_guider = comfy.samplers.CFGGuider(model)
+                    new_guider.set_conds(modified_positive, negative_cond)
+                    new_guider.set_cfg(guider.cfg_scale)
+                    sampling_guider = new_guider
+
                 elif self.cn_frame_value == 2:  # Previous Frame
-                    first_pass_positive, first_pass_negative, proc_img = self.controlnet.apply_controlnet(
-                        prev_frame, first_pass_positive, first_pass_negative, control_net,
+                    modified_positive, _, proc_img = self.controlnet.apply_controlnet(
+                        prev_frame, positive_cond, negative_cond, control_net,
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         preprocessing_step="first_pass_previous"
                     )
+
+                    # Create a new guider with the modified conditioning
+                    new_guider = comfy.samplers.CFGGuider(model)
+                    new_guider.set_conds(modified_positive, negative_cond)
+                    new_guider.set_cfg(guider.cfg_scale)
+                    sampling_guider = new_guider
             else:
                 print(f"Skipping ControlNet: None or strength={controlnet_strength}")
 
-            # Update diffusion conditioning
-            self.diffusion.positive = first_pass_positive
-            self.diffusion.negative = first_pass_negative
 
             # === STEP 6: First diffusion pass - focusing on occluded areas ===
             # Convert to PIL for inpainting
             pred_next_pil = Image.fromarray(pred_next)
             pred_occl_pil = Image.fromarray(pred_occl_gray)
 
-            # Calculate seed for this frame
-            frame_seed = seed + i if seed != 0 else i
+            # Encode the blended frame using diffusion handler for consistency
+            blended_latent = self.diffusion.encode_with_vae(pred_next_pil, device)
 
-            # First diffusion pass - inpainting mode
-            inpaint_result = self.diffusion.inpaint_with_mask(
-                pred_next_pil,
-                pred_occl_pil,
-                processing_strength,
-                sampling_steps,
-                frame_seed,
-                device
+            # Prepare mask for inpainting
+            mask_np = np.array(pred_occl_pil).astype(np.float32) / 255.0
+            mask_tensor = torch.from_numpy(mask_np).to(device)
+
+            # This next line is important - it reshapes the mask to have a channel dimension
+            noise_mask = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
+
+            # Create a latent for the first diffusion pass that includes the mask
+            first_pass_input = {
+                "samples": blended_latent,
+                "noise_mask": mask_tensor
+            }
+
+            # Calculate seed for this frame
+            frame_seed = noise.seed + i if noise.seed != 0 else i
+
+            # Create first pass noise tensor directly
+            first_noise_tensor = comfy.sample.prepare_noise(
+                first_pass_input["samples"],
+                frame_seed
             )
 
-            first_pass_latent = inpaint_result["samples"]
-            first_pass_latents.append(first_pass_latent.to(device))
+            # Apply the first pass diffusion using guider.sample (exactly as in SamplerCustomAdvanced)
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+            first_pass_samples = sampling_guider.sample(
+                first_noise_tensor,
+                first_pass_input["samples"],
+                sampler,
+                first_pass_sigmas,
+                denoise_mask=noise_mask,
+                disable_pbar=disable_pbar,
+                seed=frame_seed
+            )
+
+            # Store first pass result - make sure it's on the same device as the first element
+            first_pass_samples = first_pass_samples.to(device)
+            first_pass_latents.append(first_pass_samples)
 
             # === STEP 7: Second diffusion pass - refining the entire frame ===
-            fixed_frame_result = self.diffusion.sample_diffusion(
-                {"samples": first_pass_latent},  # Use direct latent from first pass
-                fix_frame_strength,
-                sampling_steps,
-                frame_seed + 10000
+            # Create latent for the second pass
+            second_pass_input = {
+                "samples": first_pass_samples
+            }
+
+            # For the second pass - create a new noise object with different seed
+            second_seed = frame_seed + 10000
+            second_noise_tensor = comfy.sample.prepare_noise(
+                second_pass_input["samples"],
+                second_seed
+            )
+            # Apply the second pass diffusion
+            second_pass_samples = sampling_guider.sample(
+                second_noise_tensor,
+                second_pass_input["samples"],
+                sampler,
+                second_pass_sigmas,
+                denoise_mask=None,
+                disable_pbar=disable_pbar,
+                seed=second_seed
             )
 
-            # Store this frame's latent - ensure it's on device
-            second_pass_latent = fixed_frame_result["samples"]
-            second_pass_latents.append(second_pass_latent.to(device))
+            # Store second pass result - make sure it's on the same device as the first element
+            second_pass_samples = second_pass_samples.to(device)
+            second_pass_latents.append(second_pass_samples)
 
             # Decode for next iteration
-            final_frame_np = self.diffusion.decode_latent(second_pass_latent)
+            final_frame_np = self.diffusion.decode_latent(second_pass_samples)
 
             # === STEP 8: Apply color correction ===
             final_frame_np = self.image_processor.apply_color_correction_pipeline(
@@ -404,10 +442,10 @@ class Txt2VidNode:
 
 # Node class mappings
 NODE_CLASS_MAPPINGS = {
-    "SDCNAnimation": Txt2VidNode
+    "SDCNAnimationAdvanced": Txt2VidNodeAdvanced
 }
 
 # Display names
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SDCNAnimation": "SD-CN Animation"
+    "SDCNAnimationAdvanced": "SD-CN Animation Advanced"
 }
