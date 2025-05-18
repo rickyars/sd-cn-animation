@@ -150,7 +150,7 @@ class Txt2VidNode:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
     RETURN_NAMES = ("first_pass_frames", "second_pass_frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
     FUNCTION = "generate_frames"
     CATEGORY = "animation"

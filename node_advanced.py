@@ -289,34 +289,32 @@ class Txt2VidNodeAdvanced:
 
                 # Apply ControlNet based on settings
                 if self.cn_frame_value == 1:  # Current Frame
-                    modified_positive, _, proc_img = self.controlnet.apply_controlnet(
+                    modified_positive, modified_negative, proc_img = self.controlnet.apply_controlnet(
                         pred_next, positive_cond, negative_cond, control_net,
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         preprocessing_step="first_pass_current"
                     )
 
-                    # Create a new guider with the modified conditioning
-                    # We need to copy the original guider's settings
+                    # Create a new guider with BOTH modified conditioning values
                     new_guider = comfy.samplers.CFGGuider(model)
-                    new_guider.set_conds(modified_positive, negative_cond)
+                    new_guider.set_conds(modified_positive, modified_negative)  # Use both modified conditionings
                     new_guider.set_cfg(guider.cfg_scale)
                     sampling_guider = new_guider
 
                 elif self.cn_frame_value == 2:  # Previous Frame
-                    modified_positive, _, proc_img = self.controlnet.apply_controlnet(
+                    modified_positive, modified_negative, proc_img = self.controlnet.apply_controlnet(
                         prev_frame, positive_cond, negative_cond, control_net,
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         preprocessing_step="first_pass_previous"
                     )
 
-                    # Create a new guider with the modified conditioning
+                    # Create a new guider with BOTH modified conditioning values
                     new_guider = comfy.samplers.CFGGuider(model)
-                    new_guider.set_conds(modified_positive, negative_cond)
+                    new_guider.set_conds(modified_positive, modified_negative)  # Use both modified conditionings
                     new_guider.set_cfg(guider.cfg_scale)
                     sampling_guider = new_guider
             else:
                 print(f"Skipping ControlNet: None or strength={controlnet_strength}")
-
 
             # === STEP 6: First diffusion pass - focusing on occluded areas ===
             # Convert to PIL for inpainting

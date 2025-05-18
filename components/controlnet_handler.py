@@ -29,19 +29,6 @@ class ControlNetHandler:
                          start_percent=0.0, end_percent=1.0, preprocessing_step="unknown"):
         """
         Apply ControlNet to conditioning based on an image
-
-        Args:
-            img_np: Input image as numpy array
-            positive: Positive conditioning
-            negative: Negative conditioning
-            control_net: ControlNet model
-            strength: ControlNet strength
-            start_percent: Start percent for timestep range
-            end_percent: End percent for timestep range
-            preprocessing_step: Name for logging
-
-        Returns:
-            Tuple of (updated positive conditioning, negative conditioning, processed image)
         """
         if control_net is None or img_np is None or strength == 0:
             print(f"[{preprocessing_step}] Skipping ControlNet: None or strength=0")
@@ -74,31 +61,31 @@ class ControlNetHandler:
 
         # Convert numpy array to tensor in the format expected by ControlNet
         img_tensor = torch.from_numpy(img_processed).float() / 255.0
-        if len(img_tensor.shape) == 3 and img_tensor.shape[2] == 3:  # [H, W, C]
-            img_tensor = img_tensor.permute(2, 0, 1)  # Convert to [C, H, W]
-        img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension [1, C, H, W]
 
-        # Get the device
+        # CRITICAL: Ensure proper tensor format for ControlNet
+        # If tensor is [H, W, C], convert to [B, C, H, W]
+        if len(img_tensor.shape) == 3:
+            if img_tensor.shape[2] == 3 or img_tensor.shape[2] == 1:  # [H, W, C]
+                img_tensor = img_tensor.permute(2, 0, 1)  # Convert to [C, H, W]
+
+        # Ensure batch dimension
+        if len(img_tensor.shape) == 3:  # [C, H, W]
+            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension [B, C, H, W]
+
+        # Move to device
         target_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
         img_tensor = img_tensor.to(target_device)
 
-        # Prepare control hint - move channels dimension to position 1 as expected
-        control_hint = img_tensor.movedim(-1, 1) if img_tensor.dim() == 4 and img_tensor.shape[-1] in [1, 3,
-                                                                                                       4] else img_tensor
+        # IMPORTANT: Use the ComfyUI-style control hint
+        control_hint = img_tensor
 
-        # Create new conditioning list
+        # Process each positive conditioning item
         new_positive = []
-
-        # Process each conditioning item
         for t in positive:
-            # Create a new conditioning entry with a copy of the cond dict
             n = [t[0], t[1].copy()]
-
-            # Create a copy of the control_net and set the conditioning hint and strength
             c_net = control_net.copy()
 
-            # Set the conditioning hint (image), strength, and timestep range
+            # Set the conditioning hint
             c_net.cond_hint_original = control_hint
             c_net.strength = strength
             c_net.timestep_percent_range = (start_percent, end_percent)
@@ -109,14 +96,29 @@ class ControlNetHandler:
 
             # Set the control net in the conditioning
             n[1]['control'] = c_net
-
-            # Apply to uncond (negative prompt) as well
-            n[1]['control_apply_to_uncond'] = True
-
-            # Add to the new conditioning list
+            n[1]['control_apply_to_uncond'] = False
             new_positive.append(n)
 
-        return new_positive, negative, processed_for_return
+        # Process each negative conditioning item
+        new_negative = []
+        for t in negative:
+            n = [t[0], t[1].copy()]
+            c_net = control_net.copy()
+
+            # Set the conditioning hint
+            c_net.cond_hint_original = control_hint
+            c_net.strength = strength
+            c_net.timestep_percent_range = (start_percent, end_percent)
+
+            # Link to previous controlnet if one exists
+            if 'control' in t[1]:
+                c_net.previous_controlnet = t[1]['control']
+
+            # Set the control net in the conditioning
+            n[1]['control'] = c_net
+            new_negative.append(n)
+
+        return new_positive, new_negative, processed_for_return
 
     def tile_basic_preprocessor(self, image, blur_strength=5.0):
         """
