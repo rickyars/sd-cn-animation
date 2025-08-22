@@ -7,6 +7,8 @@ import numpy as np
 import cv2
 from PIL import Image
 import comfy.utils
+import comfy.samplers
+import comfy.sample
 from comfy.utils import ProgressBar
 
 from .components import (
@@ -37,6 +39,12 @@ class Txt2VidNodeAdvanced:
 
         # Frame tracking
         self.cn_frame_value = 2  # Default: Previous Frame
+        
+        # OPTIMIZATION: Cache ControlNet-modified guider to avoid reloading
+        # Always start fresh to avoid cross-session contamination
+        self._cached_controlnet_guider = None
+        self._cached_controlnet_params = None
+        print("[CACHE] ControlNet cache initialized (cleared from any previous session)")
 
     @classmethod
     def INPUT_TYPES(s):
@@ -153,6 +161,11 @@ class Txt2VidNodeAdvanced:
             Tuple of (first_pass_latents, second_pass_latents, flow_visualization, occlusion_mask,
                     warped_frame, blended_frame, preprocessed_controlnet_input)
         """
+        # Clear cache at start of each generation to ensure clean state
+        self._cached_controlnet_guider = None
+        self._cached_controlnet_params = None
+        print("[CACHE] ControlNet cache cleared for new generation")
+        
         # Extract model from the guider
         model = guider.model_patcher
 
@@ -279,42 +292,70 @@ class Txt2VidNodeAdvanced:
             pred_next = blended_frame
 
             # === STEP 5: Apply ControlNet based on settings ===
+            # OPTIMIZATION: Cache and reuse ControlNet guider across the entire generation
             sampling_guider = guider  # Default to original guider
 
             # Only apply ControlNet if it exists and strength > 0
             if control_net is not None and controlnet_strength > 0:
-                # Get current conditioning from guider
-                positive_cond = guider.positive_cond
-                negative_cond = guider.negative_cond
+                # Create cache key for current ControlNet parameters
+                cache_key = (
+                    id(control_net), controlnet_strength, controlnet_start_percent, 
+                    controlnet_end_percent, self.cn_frame_value
+                )
+                
+                # Check if we can reuse cached ControlNet guider
+                if (self._cached_controlnet_guider is not None and 
+                    self._cached_controlnet_params == cache_key):
+                    sampling_guider = self._cached_controlnet_guider
+                    print(f"[CACHE HIT] Reusing cached ControlNet guider (strength={controlnet_strength})")
+                else:
+                    # Cache miss - need to create new ControlNet guider
+                    if self._cached_controlnet_params is not None:
+                        print(f"[CACHE MISS] Parameters changed - creating new ControlNet guider (strength={controlnet_strength})")
+                    else:
+                        print(f"[CACHE MISS] First ControlNet guider creation (strength={controlnet_strength})")
+                    
+                    # Get current conditioning from guider's internal structure
+                    positive_cond = guider.original_conds.get("positive", [])
+                    negative_cond = guider.original_conds.get("negative", [])
+                    
+                    # Ensure conditioning is in the correct format for ControlNet handler
+                    if not isinstance(positive_cond, list):
+                        positive_cond = [positive_cond] if positive_cond is not None else []
+                    if not isinstance(negative_cond, list):
+                        negative_cond = [negative_cond] if negative_cond is not None else []
 
-                # Apply ControlNet based on settings
-                if self.cn_frame_value == 1:  # Current Frame
-                    modified_positive, modified_negative, proc_img = self.controlnet.apply_controlnet(
-                        pred_next, positive_cond, negative_cond, control_net,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent,
-                        preprocessing_step="first_pass_current"
-                    )
+                    # Apply ControlNet based on settings
+                    if self.cn_frame_value == 1:  # Current Frame
+                        modified_positive, modified_negative, proc_img = self.controlnet.apply_controlnet(
+                            pred_next, positive_cond, negative_cond, control_net,
+                            controlnet_strength, controlnet_start_percent, controlnet_end_percent,
+                            preprocessing_step="first_pass_current"
+                        )
+                    elif self.cn_frame_value == 2:  # Previous Frame
+                        modified_positive, modified_negative, proc_img = self.controlnet.apply_controlnet(
+                            prev_frame, positive_cond, negative_cond, control_net,
+                            controlnet_strength, controlnet_start_percent, controlnet_end_percent,
+                            preprocessing_step="first_pass_previous"
+                        )
+                    else:
+                        # Should not reach here, but fallback to original conditioning
+                        modified_positive, modified_negative = positive_cond, negative_cond
 
-                    # Create a new guider with BOTH modified conditioning values
-                    new_guider = comfy.samplers.CFGGuider(model)
-                    new_guider.set_conds(modified_positive, modified_negative)  # Use both modified conditionings
-                    new_guider.set_cfg(guider.cfg_scale)
-                    sampling_guider = new_guider
-
-                elif self.cn_frame_value == 2:  # Previous Frame
-                    modified_positive, modified_negative, proc_img = self.controlnet.apply_controlnet(
-                        prev_frame, positive_cond, negative_cond, control_net,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent,
-                        preprocessing_step="first_pass_previous"
-                    )
-
-                    # Create a new guider with BOTH modified conditioning values
-                    new_guider = comfy.samplers.CFGGuider(model)
-                    new_guider.set_conds(modified_positive, modified_negative)  # Use both modified conditionings
-                    new_guider.set_cfg(guider.cfg_scale)
-                    sampling_guider = new_guider
+                    # Create a new guider with ControlNet conditioning
+                    sampling_guider = comfy.samplers.CFGGuider(model)
+                    sampling_guider.set_conds(modified_positive, modified_negative)
+                    sampling_guider.set_cfg(guider.cfg)
+                    
+                    # Cache the guider and parameters for future frames
+                    self._cached_controlnet_guider = sampling_guider
+                    self._cached_controlnet_params = cache_key
+                    print(f"[CACHE STORE] ControlNet guider cached for future reuse (strength={controlnet_strength})")
             else:
                 print(f"Skipping ControlNet: None or strength={controlnet_strength}")
+                # Clear cache if ControlNet is disabled
+                self._cached_controlnet_guider = None
+                self._cached_controlnet_params = None
 
             # === STEP 6: First diffusion pass - focusing on occluded areas ===
             # Convert to PIL for inpainting
@@ -346,7 +387,7 @@ class Txt2VidNodeAdvanced:
                 frame_seed
             )
 
-            # Apply the first pass diffusion using guider.sample (exactly as in SamplerCustomAdvanced)
+            # Apply the first pass diffusion using guider.sample
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
             first_pass_samples = sampling_guider.sample(
                 first_noise_tensor,
@@ -354,6 +395,7 @@ class Txt2VidNodeAdvanced:
                 sampler,
                 first_pass_sigmas,
                 denoise_mask=noise_mask,
+                callback=None,
                 disable_pbar=disable_pbar,
                 seed=frame_seed
             )
@@ -381,6 +423,7 @@ class Txt2VidNodeAdvanced:
                 sampler,
                 second_pass_sigmas,
                 denoise_mask=None,
+                callback=None,
                 disable_pbar=disable_pbar,
                 seed=second_seed
             )
@@ -392,12 +435,10 @@ class Txt2VidNodeAdvanced:
             # Decode for next iteration
             final_frame_np = self.diffusion.decode_latent(second_pass_samples)
 
-            # === STEP 8: Apply color correction ===
+            # === STEP 8: Apply minimal color correction ===
             final_frame_np = self.image_processor.apply_color_correction_pipeline(
                 final_frame_np,
-                init_frame_np,
-                saturation_limit=160,
-                histogram_strength=0.7
+                saturation_limit=200
             )
 
             # Update previous frame for next iteration

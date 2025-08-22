@@ -356,12 +356,10 @@ class Txt2VidNode:
             # Decode for next iteration
             final_frame_np = self.diffusion.decode_latent(second_pass_latent)
 
-            # === STEP 8: Apply color correction ===
+            # === STEP 8: Apply minimal color correction ===
             final_frame_np = self.image_processor.apply_color_correction_pipeline(
                 final_frame_np,
-                init_frame_np,
-                saturation_limit=160,
-                histogram_strength=0.7
+                saturation_limit=200
             )
 
             # Update previous frame for next iteration

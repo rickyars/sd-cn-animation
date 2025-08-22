@@ -1,10 +1,9 @@
 """
 Image processing utilities for the animation pipeline.
-Handles color correction, saturation control, and histogram matching.
+Handles color correction and saturation control.
 """
 import numpy as np
 import cv2
-import skimage.exposure
 
 
 class ImageProcessor:
@@ -29,30 +28,6 @@ class ImageProcessor:
         hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, max_saturation)
         return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-    def apply_histogram_matching(self, image, reference, strength=1.0):
-        """
-        Matches the color distribution of an image to a reference image.
-
-        Args:
-            image: Source RGB numpy array image
-            reference: Reference RGB numpy array image
-            strength: Blending factor (0.0 = no effect, 1.0 = full matching)
-
-        Returns:
-            Color-matched RGB image
-        """
-        # Apply full histogram matching
-        matched = skimage.exposure.match_histograms(
-            image, reference, channel_axis=-1
-        )
-
-        # Blend between original and matched based on strength
-        if strength < 1.0:
-            result = (image * (1 - strength) + matched * strength).astype(np.float32)
-            result = np.clip(result, 0, 255).astype(np.uint8)
-            return result
-        else:
-            return matched
 
     def resize_to_even_dimensions(self, image, divisor=8):
         """
@@ -93,29 +68,16 @@ class ImageProcessor:
         # Resize all images to minimum dimensions
         return [cv2.resize(img, (min_w, min_h)) for img in images]
 
-    def apply_color_correction_pipeline(self, image, reference,
-                                        saturation_limit=160,
-                                        histogram_strength=0.7):
+    def apply_color_correction_pipeline(self, image, saturation_limit=200):
         """
-        Apply a complete color correction pipeline
+        Apply a minimal color correction pipeline
 
         Args:
             image: Input image to correct
-            reference: Reference image for histogram matching
             saturation_limit: Maximum saturation value
-            histogram_strength: Strength of histogram matching
 
         Returns:
             Color-corrected image
         """
-        # First limit extreme saturation values to prevent color blowout
-        image = self.limit_saturation(image, max_saturation=saturation_limit)
-
-        # Then apply partial histogram matching to maintain consistency
-        image = self.apply_histogram_matching(
-            image,
-            reference,
-            strength=histogram_strength
-        )
-
-        return image
+        # Limit extreme saturation values to prevent color blowout
+        return self.limit_saturation(image, max_saturation=saturation_limit)

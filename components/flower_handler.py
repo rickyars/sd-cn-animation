@@ -137,16 +137,19 @@ class FloweRHandler:
 
         # Apply optical flow to warp the previous frame
         h, w = pred_flow.shape[:2]
-        flow_map = pred_flow.copy()
-        flow_map[:, :, 0] += np.arange(w)
-        flow_map[:, :, 1] += np.arange(h)[:, np.newaxis]
+        # Create flow map with sub-pixel precision
+        flow_map = pred_flow.astype(np.float32)
+        flow_map[:, :, 0] += np.arange(w, dtype=np.float32)
+        flow_map[:, :, 1] += np.arange(h, dtype=np.float32)[:, np.newaxis]
 
-        warped_frame = cv2.remap(prev_frame, flow_map, None, cv2.INTER_NEAREST,
+        warped_frame = cv2.remap(prev_frame, flow_map, None, cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_REFLECT_101)
 
         # Blend warped frame with predicted next frame using occlusion mask
-        alpha_mask = pred_occl / 255.0
-        blended_frame = pred_next.astype(float) * alpha_mask + warped_frame.astype(float) * (1 - alpha_mask)
+        # Use double precision to minimize quantization errors
+        alpha_mask = pred_occl.astype(np.float64) / 255.0
+        blended_frame = (pred_next.astype(np.float64) * alpha_mask + 
+                        warped_frame.astype(np.float64) * (1.0 - alpha_mask))
         blended_frame = np.clip(blended_frame, 0, 255).astype(np.uint8)
 
         # Get grayscale occlusion for inpainting

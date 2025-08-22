@@ -79,20 +79,69 @@ class ControlNetHandler:
         # IMPORTANT: Use the ComfyUI-style control hint
         control_hint = img_tensor
 
+        # Pre-create wrapper classes outside the loop to avoid memory leaks
+        class PlusPlusInputWrapper:
+            def __init__(self, image_tensor, control_type="tile", input_strength=1.0):
+                self.image = image_tensor
+                self.control_type = control_type
+                self.strength = input_strength
+            
+            def clone(self):
+                return PlusPlusInputWrapper(self.image, self.control_type, self.strength)
+        
+        class ControlHintWrapper:
+            def __init__(self, hint_tensor, input_strength=1.0):
+                # For Plus Plus models, create a controls dict with PlusPlusInput objects
+                plus_input = PlusPlusInputWrapper(hint_tensor, "tile", input_strength)
+                self.controls = {'tile': plus_input}
+
         # Process each positive conditioning item
         new_positive = []
-        for t in positive:
-            n = [t[0], t[1].copy()]
-            c_net = control_net.copy()
+        for i, t in enumerate(positive):
+            try:
+                # Handle different conditioning formats
+                if isinstance(t, dict):
+                    # CFGGuider format: dict with 'cross_attn' and other keys
+                    if 'cross_attn' in t:
+                        # Convert to ComfyUI conditioning format [tensor, dict]
+                        cond_tensor = t['cross_attn']
+                        cond_dict = {
+                            'pooled_output': t.get('pooled_output'),
+                            'model_conds': t.get('model_conds', {})
+                        }
+                        n = [cond_tensor, cond_dict.copy()]
+                    else:
+                        print(f"Unknown dict conditioning format for item {i}: {list(t.keys())}")
+                        continue
+                elif isinstance(t, (list, tuple)) and len(t) >= 2:
+                    # Standard ComfyUI format: [tensor, dict]
+                    n = [t[0], t[1].copy()]
+                else:
+                    print(f"Unexpected conditioning format for item {i}: {type(t)}")
+                    continue
+            except (IndexError, KeyError, TypeError) as e:
+                print(f"Error processing positive conditioning item {i}: {e}")
+                print(f"Item type: {type(t)}")
+                continue
+            
+            # OPTIMIZATION: Only copy the control net once, not per conditioning item
+            # This prevents repeated model loading and memory leaks
+            c_net = control_net.copy() if i == 0 else control_net
 
-            # Set the conditioning hint
-            c_net.cond_hint_original = control_hint
+            # Set the conditioning hint - handle different ControlNet types
+            if hasattr(c_net, 'get_control_advanced') or 'PlusPlus' in str(type(c_net)):
+                # ControlNet Plus Plus format - needs controls dict with PlusPlusInput objects
+                c_net.cond_hint_original = ControlHintWrapper(control_hint, strength)
+            else:
+                # Standard ControlNet format - direct tensor
+                c_net.cond_hint_original = control_hint
+            
             c_net.strength = strength
             c_net.timestep_percent_range = (start_percent, end_percent)
 
             # Link to previous controlnet if one exists
-            if 'control' in t[1]:
-                c_net.previous_controlnet = t[1]['control']
+            if 'control' in n[1]:
+                c_net.previous_controlnet = n[1]['control']
 
             # Set the control net in the conditioning
             n[1]['control'] = c_net
@@ -101,23 +150,59 @@ class ControlNetHandler:
 
         # Process each negative conditioning item
         new_negative = []
-        for t in negative:
-            n = [t[0], t[1].copy()]
-            c_net = control_net.copy()
+        for i, t in enumerate(negative):
+            try:
+                # Handle different conditioning formats
+                if isinstance(t, dict):
+                    # CFGGuider format: dict with 'cross_attn' and other keys
+                    if 'cross_attn' in t:
+                        # Convert to ComfyUI conditioning format [tensor, dict]
+                        cond_tensor = t['cross_attn']
+                        cond_dict = {
+                            'pooled_output': t.get('pooled_output'),
+                            'model_conds': t.get('model_conds', {})
+                        }
+                        n = [cond_tensor, cond_dict.copy()]
+                    else:
+                        print(f"Unknown dict conditioning format for item {i}: {list(t.keys())}")
+                        continue
+                elif isinstance(t, (list, tuple)) and len(t) >= 2:
+                    # Standard ComfyUI format: [tensor, dict]
+                    n = [t[0], t[1].copy()]
+                else:
+                    print(f"Unexpected conditioning format for item {i}: {type(t)}")
+                    continue
+            except (IndexError, KeyError, TypeError) as e:
+                print(f"Error processing negative conditioning item {i}: {e}")
+                print(f"Item type: {type(t)}")
+                continue
+            
+            # OPTIMIZATION: Only copy the control net once, not per conditioning item
+            # This prevents repeated model loading and memory leaks
+            c_net = control_net.copy() if i == 0 else control_net
 
-            # Set the conditioning hint
-            c_net.cond_hint_original = control_hint
+            # Set the conditioning hint - handle different ControlNet types
+            if hasattr(c_net, 'get_control_advanced') or 'PlusPlus' in str(type(c_net)):
+                # ControlNet Plus Plus format - reuse wrapper classes defined earlier
+                c_net.cond_hint_original = ControlHintWrapper(control_hint, strength)
+            else:
+                # Standard ControlNet format - direct tensor
+                c_net.cond_hint_original = control_hint
+            
             c_net.strength = strength
             c_net.timestep_percent_range = (start_percent, end_percent)
 
             # Link to previous controlnet if one exists
-            if 'control' in t[1]:
-                c_net.previous_controlnet = t[1]['control']
+            if 'control' in n[1]:
+                c_net.previous_controlnet = n[1]['control']
 
             # Set the control net in the conditioning
             n[1]['control'] = c_net
             new_negative.append(n)
 
+        # Explicit cleanup to prevent memory leaks
+        del PlusPlusInputWrapper, ControlHintWrapper
+        
         return new_positive, new_negative, processed_for_return
 
     def tile_basic_preprocessor(self, image, blur_strength=5.0):
