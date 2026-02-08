@@ -6,7 +6,15 @@ import torch
 import numpy as np
 import cv2
 from PIL import Image
+import comfy.utils
+import comfy.samplers
+import comfy.sample
+import comfy.sampler_helpers
+import comfy.model_management
+import comfy.model_patcher
+import comfy.hooks
 from comfy.utils import ProgressBar
+from comfy.samplers import calculate_sigmas, sampler_object, preprocess_conds_hooks, get_total_hook_groups_in_conds, filter_registered_hooks_on_conds, cast_to_load_options
 
 from .components import (
     FloweRHandler,
@@ -33,8 +41,8 @@ class Txt2VidNode:
         self.image_processor = ImageProcessor()
         self.visualization = VisualizationHandler()
 
-        # Frame tracking
-        self.cn_frame_value = 2  # Default: Previous Frame
+        # Frame tracking - always use Previous Frame (most stable)
+        self.cn_frame_value = 2
 
     @classmethod
     def INPUT_TYPES(s):
@@ -51,9 +59,6 @@ class Txt2VidNode:
                     "min": 2,
                     "max": 1000,
                     "step": 1
-                }),
-                "cn_frame_send": (["None", "Current Frame", "Previous Frame"], {
-                    "default": "Previous Frame",
                 }),
                 "tile_preprocessor": (["None", "Basic", "ColorFix"], {
                     "default": "ColorFix",
@@ -112,35 +117,19 @@ class Txt2VidNode:
                     "max": 1.0,
                     "step": 0.01
                 }),
-                "occlusion_mask_blur": ("FLOAT", {
-                    "default": 5.0,
-                    "min": 0.0,
-                    "max": 100.0,
-                    "step": 0.1
-                }),
                 "occlusion_mask_multiplier": ("FLOAT", {
-                    "default": 5.0,
+                    "default": 10.0,
                     "min": 0.0,
-                    "max": 100.0,
-                    "step": 0.1
+                    "max": 50.0,
+                    "step": 0.5,
+                    "display": "Occlusion Mask Strength"
                 }),
-                "occlusion_flow_multiplier": ("FLOAT", {
-                    "default": 1.0,
+                "occlusion_mask_blur": ("FLOAT", {
+                    "default": 0.0,
                     "min": 0.0,
-                    "max": 100.0,
-                    "step": 0.1
-                }),
-                "occlusion_difo_multiplier": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.0,
-                    "max": 100.0,
-                    "step": 0.1
-                }),
-                "occlusion_difs_multiplier": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.0,
-                    "max": 100.0,
-                    "step": 0.1
+                    "max": 10.0,
+                    "step": 0.1,
+                    "display": "Occlusion Mask Blur"
                 }),
                 "seed": ("INT", {
                     "default": 0,
@@ -150,27 +139,19 @@ class Txt2VidNode:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("first_pass_frames", "second_pass_frames", "flow_visualization", "occlusion_mask", "warped_frame", "blended_frame")
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent_frames",)
     FUNCTION = "generate_frames"
     CATEGORY = "animation"
 
-    def generate_frames(self, model, positive, negative, latent, vae, control_net, num_frames, cn_frame_send,
+    def generate_frames(self, model, positive, negative, latent, vae, control_net, num_frames,
                         controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                         sampling_steps, cfg, sampler_name, scheduler, processing_strength, fix_frame_strength,
-                        occlusion_mask_blur, occlusion_mask_multiplier, occlusion_flow_multiplier,
-                        occlusion_difo_multiplier, occlusion_difs_multiplier, seed, tile_preprocessor, tile_blur_strength):
+                        occlusion_mask_multiplier, occlusion_mask_blur, seed, tile_preprocessor, tile_blur_strength):
         """
         Generate a sequence of latent frames with iterative diffusion
-
-        Args:
-            All parameters from the node interface
-
-        Returns:
-            Tuple of (first_pass_latents, second_pass_latents, flow_visualization, occlusion_mask,
-                     warped_frame, blended_frame, preprocessed_controlnet_input)
         """
-        # Initialize component parameters
+        # Initialize diffusion handler with VAE (still used for encode/decode)
         self.diffusion.set_model_params(
             model, vae, positive, negative, cfg, sampler_name, scheduler
         )
@@ -179,26 +160,16 @@ class Txt2VidNode:
             tile_preprocessor, tile_blur_strength
         )
 
-        # Convert cn_frame_send string to numeric value
-        cn_frame_options = ["None", "Current Frame", "Previous Frame"]
-        self.cn_frame_value = cn_frame_options.index(cn_frame_send)
+        # Always use Previous Frame for ControlNet (most stable)
+        self.cn_frame_value = 2
 
         # Use CUDA device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
 
-        # Initialize collections for debug visualizations
-        flow_visualizations = []
-        occlusion_masks = []
-        warped_frames = []
-        blended_frames = []
-
         # === STEP 1: Get initial frame by decoding the input latent ===
         print("Decoding initial latent")
-        # Ensure latent is on the correct device
         latent_on_device = latent_utils.ensure_latent_on_device(latent, device)
-
-        # Decode latent to image
         init_frame_np = self.diffusion.decode_latent(latent_on_device["samples"])
         print(f"Initial frame shape: {init_frame_np.shape}")
 
@@ -216,188 +187,243 @@ class Txt2VidNode:
         self.flower.load_model(size[0], size[1])
 
         # Initialize frames buffer for FloweR (needs 4 frames for context)
-        clip_frames = np.zeros((4, size[1], size[0], 3), dtype=np.uint8)
+        # Pre-fill with initial frame so FloweR sees a still scene initially
+        # (zeros would make FloweR think everything changed → 97% occlusion on frame 1)
+        init_resized = cv2.resize(init_frame_np, size)
+        clip_frames = np.stack([init_resized] * 4, axis=0)
         prev_frame = init_frame_np.copy()
 
         # Initialize latent frames array with initial latent
-        first_pass_latents = [latent["samples"].to(device)]  # First pass latents
-        second_pass_latents = [latent["samples"].to(device)]  # Final refined latents
-
-        # For the first frame visualization (placeholder):
-        h, w = init_frame_np.shape[:2]
-        target_h = (h // 8) * 8
-        target_w = (w // 8) * 8
-
-        # ComfyUI expects IMAGE type in format [B, H, W, C] with values 0-1
-        placeholder = np.zeros((target_h, target_w, 3), dtype=np.float32)
-        flow_visualizations.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())  # Convert to [C, H, W]
-        occlusion_masks.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
-        warped_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
-        blended_frames.append(torch.from_numpy(placeholder).permute(2, 0, 1).float())
+        first_pass_latents = [latent["samples"].to(device)]
+        second_pass_latents = [latent["samples"].to(device)]
 
         # Initialize progress tracking
         pbar = ProgressBar(num_frames)
 
-        # === STEP 3: Generate the sequence ===
-        print(f"Generating {num_frames} frames")
-        for i in range(num_frames - 1):
-            print(f"Processing frame {i + 2}/{num_frames}")
+        # === STEP 3: Build sampling context ===
+        # Compute sigmas for both passes
+        model_sampling = model.get_model_object("model_sampling")
 
-            # Update clip frames with previous frame
-            clip_frames = np.roll(clip_frames, -1, axis=0)
-            prev_frame_resized = cv2.resize(prev_frame, size)
-            clip_frames[-1] = prev_frame_resized
+        # First pass sigmas (high strength - inpainting)
+        first_pass_steps = sampling_steps
+        if processing_strength <= 0.0:
+            first_pass_sigmas = torch.FloatTensor([])
+        elif processing_strength > 0.9999:
+            first_pass_sigmas = calculate_sigmas(model_sampling, scheduler, first_pass_steps)
+        else:
+            new_steps = int(first_pass_steps / processing_strength)
+            sigmas = calculate_sigmas(model_sampling, scheduler, new_steps)
+            first_pass_sigmas = sigmas[-(first_pass_steps + 1):]
 
-            # === STEP 4: Predict flow using FloweR ===
-            pred_flow, pred_occl, pred_next = self.flower.predict_flow(clip_frames)
+        # Second pass sigmas (low strength - refinement)
+        second_pass_steps = sampling_steps
+        if fix_frame_strength <= 0.0:
+            second_pass_sigmas = torch.FloatTensor([])
+        elif fix_frame_strength > 0.9999:
+            second_pass_sigmas = calculate_sigmas(model_sampling, scheduler, second_pass_steps)
+        else:
+            new_steps = int(second_pass_steps / fix_frame_strength)
+            sigmas = calculate_sigmas(model_sampling, scheduler, new_steps)
+            second_pass_sigmas = sigmas[-(second_pass_steps + 1):]
 
-            # Process flow predictions to get warped frame
-            flow_result = self.flower.process_flow(
-                pred_flow, pred_occl, pred_next, prev_frame, org_size,
-                occlusion_mask_multiplier, occlusion_flow_multiplier,
-                occlusion_difo_multiplier, occlusion_mask_blur,
-                occlusion_difs_multiplier
+        # Create sampler object
+        sampler_obj = sampler_object(sampler_name)
+
+        # === STEP 4: Setup ControlNet and build guider (once) ===
+        working_positive = list(map(lambda a: a.copy(), comfy.sampler_helpers.convert_cond(positive)))
+        working_negative = list(map(lambda a: a.copy(), comfy.sampler_helpers.convert_cond(negative)))
+        c_net_copy = None  # Will hold the ControlNet copy for per-frame updates
+
+        if control_net is not None and controlnet_strength > 0:
+            print(f"Setting up ControlNet guider (strength={controlnet_strength})")
+            cn_frame = prev_frame
+            working_positive, working_negative, c_net_copy = self.controlnet.apply_controlnet(
+                cn_frame, working_positive, working_negative, control_net,
+                controlnet_strength, controlnet_start_percent, controlnet_end_percent,
+                preprocessing_step="initial_setup"
+            )
+        else:
+            print(f"Skipping ControlNet: None or strength={controlnet_strength}")
+
+        # Create CFGGuider
+        sampling_guider = comfy.samplers.CFGGuider(model)
+        sampling_guider.set_conds(working_positive, working_negative)
+        sampling_guider.set_cfg(cfg)
+
+        # === STEP 5: Prepare sampling context ONCE ===
+        print("Preparing sampling context (loading models once)...")
+
+        # Build conditioning
+        sampling_guider.conds = {}
+        for k in sampling_guider.original_conds:
+            sampling_guider.conds[k] = list(map(lambda a: a.copy(), sampling_guider.original_conds[k]))
+        preprocess_conds_hooks(sampling_guider.conds)
+
+        # Set up model options
+        orig_model_options = sampling_guider.model_options
+        sampling_guider.model_options = comfy.model_patcher.create_model_options_clone(sampling_guider.model_options)
+        orig_hook_mode = sampling_guider.model_patcher.hook_mode
+        if get_total_hook_groups_in_conds(sampling_guider.conds) <= 1:
+            sampling_guider.model_patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+        comfy.sampler_helpers.prepare_model_patcher(sampling_guider.model_patcher, sampling_guider.conds, sampling_guider.model_options)
+        filter_registered_hooks_on_conds(sampling_guider.conds, sampling_guider.model_options)
+
+        # Use dummy noise shape for memory estimation
+        dummy_noise = comfy.sample.prepare_noise(latent["samples"].to(device), seed)
+
+        # prepare_sampling: loads models to GPU and returns inner_model
+        sampling_guider.inner_model, sampling_guider.conds, sampling_guider.loaded_models = \
+            comfy.sampler_helpers.prepare_sampling(
+                sampling_guider.model_patcher, dummy_noise.shape,
+                sampling_guider.conds, sampling_guider.model_options
             )
 
-            # Extract processed results
-            pred_flow = flow_result['flow']
-            pred_occl = flow_result['occlusion']
-            pred_occl_gray = flow_result['occlusion_gray']
-            pred_next = flow_result['predicted_next']
-            warped_frame = flow_result['warped_frame']
-            blended_frame = flow_result['blended_frame']
+        load_device = sampling_guider.model_patcher.load_device
+        model_dtype = sampling_guider.model_patcher.model_dtype()
+        cast_to_load_options(sampling_guider.model_options, device=load_device, dtype=model_dtype)
 
-            # Create flow visualization for debug output
-            flow_vis = self.visualization.create_flow_visualization(pred_flow)
-            flow_vis = cv2.resize(flow_vis, (target_w, target_h))  # Ensure consistent size
-            flow_vis = np.clip(flow_vis, 0, 255).astype(np.uint8)
-            flow_tensor = torch.from_numpy(flow_vis).permute(2, 0, 1).float() / 255.0
-            flow_visualizations.append(flow_tensor)
+        # pre_run: initialize model state
+        sampling_guider.model_patcher.pre_run()
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-            # Prepare other visualizations
-            occlusion_vis = np.clip(pred_occl, 0, 255).astype(np.uint8)
-            occlusion_vis = cv2.resize(occlusion_vis, (target_w, target_h))
-            occlusion_tensor = torch.from_numpy(occlusion_vis).permute(2, 0, 1).float() / 255.0
-            occlusion_masks.append(occlusion_tensor)
+        print("Models loaded and ready - entering frame generation loop")
 
-            warped_vis = np.clip(warped_frame, 0, 255).astype(np.uint8)
-            warped_vis = cv2.resize(warped_vis, (target_w, target_h))
-            warped_tensor = torch.from_numpy(warped_vis).permute(2, 0, 1).float() / 255.0
-            warped_frames.append(warped_tensor)
+        # === STEP 6: Generate frames with models staying loaded ===
+        try:
+            print(f"Generating {num_frames} frames")
+            for i in range(num_frames - 1):
+                print(f"Processing frame {i + 2}/{num_frames}")
 
-            blended_vis = np.clip(blended_frame, 0, 255).astype(np.uint8)
-            blended_vis = cv2.resize(blended_vis, (target_w, target_h))
-            blended_tensor = torch.from_numpy(blended_vis).permute(2, 0, 1).float() / 255.0
-            blended_frames.append(blended_tensor)
+                # Update clip frames with previous frame
+                clip_frames = np.roll(clip_frames, -1, axis=0)
+                prev_frame_resized = cv2.resize(prev_frame, size)
+                clip_frames[-1] = prev_frame_resized
 
-            # Use the blended frame as the base for further processing
-            pred_next = blended_frame
+                # === Predict flow using FloweR ===
+                pred_flow, pred_occl, pred_next = self.flower.predict_flow(clip_frames)
 
-            # === STEP 5: Apply ControlNet based on settings ===
-            # Create fresh conditioning for first pass
-            first_pass_positive = positive.copy()
-            first_pass_negative = negative.copy()
+                flow_result = self.flower.process_flow(
+                    pred_flow, pred_occl, pred_next, org_size,
+                    occlusion_mask_multiplier, occlusion_mask_blur
+                )
 
-            # Only apply ControlNet if it exists and strength > 0
-            if control_net is not None and controlnet_strength > 0:
-                # Apply ControlNet for first pass depending on settings
-                if self.cn_frame_value == 1:  # Current Frame
-                    first_pass_positive, first_pass_negative, proc_img = self.controlnet.apply_controlnet(
-                        pred_next, first_pass_positive, first_pass_negative, control_net,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent,
-                        preprocessing_step="first_pass_current"
+                pred_occl_gray = flow_result['occlusion_gray']
+                pred_next = flow_result['predicted_next']
+
+                # === Update ControlNet hint with previous frame ===
+                if c_net_copy is not None:
+                    self.controlnet.update_controlnet_hint(
+                        c_net_copy, prev_frame, controlnet_strength,
+                        controlnet_start_percent, controlnet_end_percent
                     )
-                elif self.cn_frame_value == 2:  # Previous Frame
-                    first_pass_positive, first_pass_negative, proc_img = self.controlnet.apply_controlnet(
-                        prev_frame, first_pass_positive, first_pass_negative, control_net,
-                        controlnet_strength, controlnet_start_percent, controlnet_end_percent,
-                        preprocessing_step="first_pass_previous"
-                    )
-            else:
-                print(f"Skipping ControlNet: None or strength={controlnet_strength}")
 
-            # Update diffusion conditioning
-            self.diffusion.positive = first_pass_positive
-            self.diffusion.negative = first_pass_negative
+                # === First diffusion pass - inpainting occluded areas ===
+                pred_next_pil = Image.fromarray(pred_next)
+                pred_occl_pil = Image.fromarray(pred_occl_gray)
 
-            # === STEP 6: First diffusion pass - focusing on occluded areas ===
-            # Convert to PIL for inpainting
-            pred_next_pil = Image.fromarray(pred_next)
-            pred_occl_pil = Image.fromarray(pred_occl_gray)
+                blended_latent = self.diffusion.encode_with_vae(pred_next_pil, device)
 
-            # Calculate seed for this frame
-            frame_seed = seed + i if seed != 0 else i
+                mask_np = np.array(pred_occl_pil).astype(np.float32) / 255.0
+                mask_tensor = torch.from_numpy(mask_np).to(device)
+                noise_mask = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
 
-            # First diffusion pass - inpainting mode
-            inpaint_result = self.diffusion.inpaint_with_mask(
-                pred_next_pil,
-                pred_occl_pil,
-                processing_strength,
-                sampling_steps,
-                frame_seed,
-                device
-            )
+                frame_seed = seed + i if seed != 0 else i
+                first_noise_tensor = comfy.sample.prepare_noise(blended_latent, frame_seed)
 
-            first_pass_latent = inpaint_result["samples"]
-            first_pass_latents.append(first_pass_latent.to(device))
+                # Prepare denoise mask
+                latent_shape = blended_latent.shape
+                prepared_mask = comfy.sampler_helpers.prepare_mask(noise_mask, latent_shape, load_device)
 
-            # === STEP 7: Second diffusion pass - refining the entire frame ===
-            fixed_frame_result = self.diffusion.sample_diffusion(
-                {"samples": first_pass_latent},  # Use direct latent from first pass
-                fix_frame_strength,
-                sampling_steps,
-                frame_seed + 10000
-            )
+                # Call inner_sample directly - no model loading/unloading!
+                first_noise_on_device = first_noise_tensor.to(load_device)
+                blended_on_device = blended_latent.to(load_device)
+                first_sigmas_on_device = first_pass_sigmas.to(load_device)
 
-            # Store this frame's latent - ensure it's on device
-            second_pass_latent = fixed_frame_result["samples"]
-            second_pass_latents.append(second_pass_latent.to(device))
+                # Rebuild conds from original before each inner_sample call
+                # (process_conds inside inner_sample mutates self.conds in place;
+                #  without rebuilding, conds accumulate stale state across calls)
+                sampling_guider.conds = {}
+                for k in sampling_guider.original_conds:
+                    sampling_guider.conds[k] = list(map(lambda a: a.copy(), sampling_guider.original_conds[k]))
+                preprocess_conds_hooks(sampling_guider.conds)
+                filter_registered_hooks_on_conds(sampling_guider.conds, sampling_guider.model_options)
 
-            # Decode for next iteration
-            final_frame_np = self.diffusion.decode_latent(second_pass_latent)
+                first_pass_samples = sampling_guider.inner_sample(
+                    first_noise_on_device, blended_on_device, load_device,
+                    sampler_obj, first_sigmas_on_device,
+                    prepared_mask, None, disable_pbar, frame_seed
+                )
 
-            # === STEP 8: Apply minimal color correction ===
-            final_frame_np = self.image_processor.apply_color_correction_pipeline(
-                final_frame_np,
-                saturation_limit=200
-            )
+                first_pass_samples = first_pass_samples.to(device)
+                first_pass_latents.append(first_pass_samples)
 
-            # Update previous frame for next iteration
-            prev_frame = final_frame_np.copy()
+                # === Intermediate: decode to pixels, histogram match, re-encode ===
+                # Reference decodes between passes and applies histogram matching
+                first_pass_frame_np = self.diffusion.decode_latent(first_pass_samples)
+                first_pass_frame_np = self.image_processor.match_histograms(first_pass_frame_np, init_frame_np)
+                first_pass_frame_np = np.clip(first_pass_frame_np, 0, 255).astype(np.uint8)
+                first_pass_pil = Image.fromarray(first_pass_frame_np)
+                second_pass_input = self.diffusion.encode_with_vae(first_pass_pil, device)
 
-            # Update progress
-            pbar.update(1)
+                # === Second diffusion pass - refining the entire frame ===
+                second_seed = frame_seed + 10000
+                second_noise_tensor = comfy.sample.prepare_noise(second_pass_input, second_seed)
 
-        # === STEP 9: Prepare output tensors ===
-        # Stack all latents for output
-        stacked_first_pass = torch.cat(first_pass_latents, dim=0)  # Stack first pass latents
-        stacked_second_pass = torch.cat(second_pass_latents, dim=0)  # Stack second pass latents
+                second_noise_on_device = second_noise_tensor.to(load_device)
+                second_pass_input_on_device = second_pass_input.to(load_device)
+                second_sigmas_on_device = second_pass_sigmas.to(load_device)
 
-        # Stack tensors into batches
-        flow_batch = torch.stack(flow_visualizations)
-        occlusion_batch = torch.stack(occlusion_masks)
-        warped_batch = torch.stack(warped_frames)
-        blended_batch = torch.stack(blended_frames)
+                # Rebuild conds from original before each inner_sample call
+                sampling_guider.conds = {}
+                for k in sampling_guider.original_conds:
+                    sampling_guider.conds[k] = list(map(lambda a: a.copy(), sampling_guider.original_conds[k]))
+                preprocess_conds_hooks(sampling_guider.conds)
+                filter_registered_hooks_on_conds(sampling_guider.conds, sampling_guider.model_options)
 
-        # If needed, convert format for ComfyUI compatibility
-        flow_batch = flow_batch.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
-        occlusion_batch = occlusion_batch.permute(0, 2, 3, 1)
-        warped_batch = warped_batch.permute(0, 2, 3, 1)
-        blended_batch = blended_batch.permute(0, 2, 3, 1)
+                second_pass_samples = sampling_guider.inner_sample(
+                    second_noise_on_device, second_pass_input_on_device, load_device,
+                    sampler_obj, second_sigmas_on_device,
+                    None, None, disable_pbar, second_seed
+                )
 
-        # Clean up
+                second_pass_samples = second_pass_samples.to(device)
+                second_pass_latents.append(second_pass_samples)
+
+                # Decode for next iteration
+                final_frame_np = self.diffusion.decode_latent(second_pass_samples)
+
+                # Match histograms to initial frame to prevent color drift
+                # (reference does this after BOTH passes)
+                final_frame_np = self.image_processor.match_histograms(final_frame_np, init_frame_np)
+                final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
+
+                prev_frame = final_frame_np.copy()
+                pbar.update(1)
+
+        finally:
+            # === STEP 7: Cleanup ONCE after all frames ===
+            # Match the exact cleanup sequence from outer_sample() + guider.sample()
+            # outer_sample() cleanup:
+            sampling_guider.model_patcher.cleanup()
+            comfy.sampler_helpers.cleanup_models(sampling_guider.conds, sampling_guider.loaded_models)
+            del sampling_guider.inner_model
+            del sampling_guider.loaded_models
+
+            # guider.sample() cleanup - restore state to pre-sampling condition:
+            cast_to_load_options(sampling_guider.model_options, device=sampling_guider.model_patcher.offload_device)
+            sampling_guider.model_options = orig_model_options  # Restore original model_options
+            sampling_guider.model_patcher.hook_mode = orig_hook_mode
+            sampling_guider.model_patcher.restore_hook_patches()
+            del sampling_guider.conds
+            # Do NOT clear original_conds - let ComfyUI manage the guider lifecycle
+
+        # === STEP 8: Prepare output ===
+        stacked_latents = torch.cat(second_pass_latents, dim=0)
+
         self.flower.clear_memory()
         print("Animation generation complete")
 
-        # Return all visualizations
-        return (
-            {"samples": stacked_first_pass},
-            {"samples": stacked_second_pass},
-            flow_batch,
-            occlusion_batch,
-            warped_batch,
-            blended_batch
-        )
+        return ({"samples": stacked_latents},)
 
 
 # Node class mappings

@@ -1,5 +1,7 @@
 """
 ControlNet handler for managing ControlNet processing in the animation pipeline.
+Uses standard ComfyUI copy() + set_cond_hint() flow for compatibility with all
+ControlNet types including ControlNet++ from comfyui-advanced-controlnet.
 """
 import torch
 import numpy as np
@@ -15,257 +17,138 @@ class ControlNetHandler:
         self.tile_blur_strength = 5.0  # Default blur strength
 
     def set_preprocessor(self, preprocessor_type, blur_strength=5.0):
-        """
-        Set the tile preprocessor type and blur strength
-
-        Args:
-            preprocessor_type: Type of preprocessor ("None", "Basic", "ColorFix")
-            blur_strength: Strength of blur (0.0-25.0)
-        """
         self.tile_preprocessor = preprocessor_type
         self.tile_blur_strength = blur_strength
+
+    def _preprocess_image(self, img_np):
+        """Apply tile preprocessing to an image and return [B, C, H, W] tensor 0-1"""
+        img_processed = img_np.copy()
+
+        if self.tile_preprocessor == "ColorFix":
+            img_processed = self.tile_colorfix_preprocessor(img_processed, blur_strength=self.tile_blur_strength)
+        elif self.tile_preprocessor == "Basic":
+            img_processed = self.tile_basic_preprocessor(img_processed, blur_strength=self.tile_blur_strength)
+
+        # Convert uint8 numpy [H, W, C] to float [B, C, H, W] tensor (ComfyUI convention)
+        # ComfyUI IMAGE type is [B, H, W, C] 0-1, but set_cond_hint expects [B, C, H, W]
+        # (the standard apply nodes do image.movedim(-1, 1) before passing to set_cond_hint)
+        img_tensor = torch.from_numpy(img_processed).float() / 255.0  # [H, W, C] 0-1
+        img_tensor = img_tensor.unsqueeze(0)  # [1, H, W, C]
+        img_tensor = img_tensor.movedim(-1, 1)  # [1, C, H, W] — matches ComfyUI convention
+        return img_processed, img_tensor
 
     def apply_controlnet(self, img_np, positive, negative, control_net, strength,
                          start_percent=0.0, end_percent=1.0, preprocessing_step="unknown"):
         """
-        Apply ControlNet to conditioning based on an image
+        Apply ControlNet to conditioning using standard ComfyUI copy()+set_cond_hint() flow.
+        Compatible with all ControlNet types including ControlNet++.
+
+        Returns: (new_positive, new_negative, c_net_copy)
+            c_net_copy is the ControlNet copy to be used for updating hints in subsequent frames.
         """
         if control_net is None or img_np is None or strength == 0:
             print(f"[{preprocessing_step}] Skipping ControlNet: None or strength=0")
             return positive, negative, None
 
-        # Make a copy of the image to avoid modifying the original
-        img_processed = img_np.copy()
-
-        # Apply tile preprocessing if enabled
         if self.tile_preprocessor != "None":
-            print(
-                f"[{preprocessing_step}] Applying {self.tile_preprocessor} preprocessing with blur={self.tile_blur_strength}")
+            print(f"[{preprocessing_step}] Applying {self.tile_preprocessor} preprocessing with blur={self.tile_blur_strength}")
 
-            # Apply the selected tile preprocessor
-            if self.tile_preprocessor == "ColorFix":
-                img_processed = self.tile_colorfix_preprocessor(
-                    img_processed,
-                    blur_strength=self.tile_blur_strength
-                )
-            elif self.tile_preprocessor == "Basic":
-                img_processed = self.tile_basic_preprocessor(
-                    img_processed,
-                    blur_strength=self.tile_blur_strength
-                )
-        else:
-            print(f"[{preprocessing_step}] No preprocessing applied (set to None)")
+        processed_img, control_hint = self._preprocess_image(img_np)
 
-        # Keep processed for return
-        processed_for_return = img_processed.copy()
+        # Use standard ComfyUI flow: copy() + set_cond_hint()
+        # copy() creates a new ControlNet sharing the model weights (no VRAM duplication)
+        # set_cond_hint() properly handles all ControlNet types:
+        #   - Standard ControlNet: stores tensor directly
+        #   - ControlNet++ (advanced): set_cond_hint_inject wraps into PlusPlusInputGroup
+        c_net = control_net.copy()
 
-        # Convert numpy array to tensor in the format expected by ControlNet
-        img_tensor = torch.from_numpy(img_processed).float() / 255.0
+        # Fix: ControlNetPlusPlusAdvanced.copy() creates a NEW control_model_wrapped
+        # ModelPatcher in its __init__ instead of sharing the original's (unlike standard
+        # ControlNet.copy() which passes None to skip creation, then assigns the original).
+        # This orphan ModelPatcher triggers ComfyUI's "memory leak" detection when GC'd.
+        # Patch the copy to share the original's ModelPatcher, matching standard behavior.
+        if hasattr(control_net, 'control_model_wrapped') and hasattr(c_net, 'control_model_wrapped'):
+            if c_net.control_model_wrapped is not control_net.control_model_wrapped:
+                c_net.control_model_wrapped = control_net.control_model_wrapped
 
-        # CRITICAL: Ensure proper tensor format for ControlNet
-        # If tensor is [H, W, C], convert to [B, C, H, W]
-        if len(img_tensor.shape) == 3:
-            if img_tensor.shape[2] == 3 or img_tensor.shape[2] == 1:  # [H, W, C]
-                img_tensor = img_tensor.permute(2, 0, 1)  # Convert to [C, H, W]
+        c_net.set_cond_hint(control_hint, strength, (start_percent, end_percent))
 
-        # Ensure batch dimension
-        if len(img_tensor.shape) == 3:  # [C, H, W]
-            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension [B, C, H, W]
+        print(f"[{preprocessing_step}] ControlNet applied: type={type(control_net).__name__}, strength={strength}")
 
-        # Move to device
-        target_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        img_tensor = img_tensor.to(target_device)
-
-        # IMPORTANT: Use the ComfyUI-style control hint
-        control_hint = img_tensor
-
-        # Pre-create wrapper classes outside the loop to avoid memory leaks
-        class PlusPlusInputWrapper:
-            def __init__(self, image_tensor, control_type="tile", input_strength=1.0):
-                self.image = image_tensor
-                self.control_type = control_type
-                self.strength = input_strength
-            
-            def clone(self):
-                return PlusPlusInputWrapper(self.image, self.control_type, self.strength)
-        
-        class ControlHintWrapper:
-            def __init__(self, hint_tensor, input_strength=1.0):
-                # For Plus Plus models, create a controls dict with PlusPlusInput objects
-                plus_input = PlusPlusInputWrapper(hint_tensor, "tile", input_strength)
-                self.controls = {'tile': plus_input}
-
-        # Process each positive conditioning item
-        new_positive = []
-        for i, t in enumerate(positive):
-            try:
-                # Handle different conditioning formats
-                if isinstance(t, dict):
-                    # CFGGuider format: dict with 'cross_attn' and other keys
-                    if 'cross_attn' in t:
-                        # Convert to ComfyUI conditioning format [tensor, dict]
-                        cond_tensor = t['cross_attn']
-                        cond_dict = {
-                            'pooled_output': t.get('pooled_output'),
-                            'model_conds': t.get('model_conds', {})
-                        }
-                        n = [cond_tensor, cond_dict.copy()]
-                    else:
-                        print(f"Unknown dict conditioning format for item {i}: {list(t.keys())}")
-                        continue
-                elif isinstance(t, (list, tuple)) and len(t) >= 2:
-                    # Standard ComfyUI format: [tensor, dict]
-                    n = [t[0], t[1].copy()]
+        # Build new conditioning with ControlNet attached
+        # Uses same pattern as ComfyUI's ControlNetApplyAdvanced node
+        #
+        # Conditioning can be in two formats:
+        #   1. Standard ComfyUI: list of [tensor, dict] pairs (from CONDITIONING type)
+        #   2. Internal/guider format: list of dicts with 'cross_attn' key (from guider.original_conds)
+        # We handle both and always output format #1 for set_conds() compatibility.
+        cnets = {}
+        out = []
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                if isinstance(t, (list, tuple)) and len(t) >= 2:
+                    # Standard format: [tensor, dict]
+                    cond_tensor = t[0]
+                    d = t[1].copy()
+                elif isinstance(t, dict):
+                    # Internal guider format: dict with 'cross_attn' key
+                    d = t.copy()
+                    cond_tensor = d.pop('cross_attn', None)
                 else:
-                    print(f"Unexpected conditioning format for item {i}: {type(t)}")
+                    print(f"Unexpected conditioning format: {type(t)}")
                     continue
-            except (IndexError, KeyError, TypeError) as e:
-                print(f"Error processing positive conditioning item {i}: {e}")
-                print(f"Item type: {type(t)}")
-                continue
-            
-            # OPTIMIZATION: Only copy the control net once, not per conditioning item
-            # This prevents repeated model loading and memory leaks
-            c_net = control_net.copy() if i == 0 else control_net
 
-            # Set the conditioning hint - handle different ControlNet types
-            if hasattr(c_net, 'get_control_advanced') or 'PlusPlus' in str(type(c_net)):
-                # ControlNet Plus Plus format - needs controls dict with PlusPlusInput objects
-                c_net.cond_hint_original = ControlHintWrapper(control_hint, strength)
-            else:
-                # Standard ControlNet format - direct tensor
-                c_net.cond_hint_original = control_hint
-            
-            c_net.strength = strength
-            c_net.timestep_percent_range = (start_percent, end_percent)
-
-            # Link to previous controlnet if one exists
-            if 'control' in n[1]:
-                c_net.previous_controlnet = n[1]['control']
-
-            # Set the control net in the conditioning
-            n[1]['control'] = c_net
-            n[1]['control_apply_to_uncond'] = False
-            new_positive.append(n)
-
-        # Process each negative conditioning item
-        new_negative = []
-        for i, t in enumerate(negative):
-            try:
-                # Handle different conditioning formats
-                if isinstance(t, dict):
-                    # CFGGuider format: dict with 'cross_attn' and other keys
-                    if 'cross_attn' in t:
-                        # Convert to ComfyUI conditioning format [tensor, dict]
-                        cond_tensor = t['cross_attn']
-                        cond_dict = {
-                            'pooled_output': t.get('pooled_output'),
-                            'model_conds': t.get('model_conds', {})
-                        }
-                        n = [cond_tensor, cond_dict.copy()]
-                    else:
-                        print(f"Unknown dict conditioning format for item {i}: {list(t.keys())}")
-                        continue
-                elif isinstance(t, (list, tuple)) and len(t) >= 2:
-                    # Standard ComfyUI format: [tensor, dict]
-                    n = [t[0], t[1].copy()]
+                prev_cnet = d.get('control', None)
+                if prev_cnet in cnets:
+                    c_net_for_cond = cnets[prev_cnet]
                 else:
-                    print(f"Unexpected conditioning format for item {i}: {type(t)}")
-                    continue
-            except (IndexError, KeyError, TypeError) as e:
-                print(f"Error processing negative conditioning item {i}: {e}")
-                print(f"Item type: {type(t)}")
-                continue
-            
-            # OPTIMIZATION: Only copy the control net once, not per conditioning item
-            # This prevents repeated model loading and memory leaks
-            c_net = control_net.copy() if i == 0 else control_net
+                    c_net_for_cond = c_net
+                    c_net_for_cond.set_previous_controlnet(prev_cnet)
+                    cnets[prev_cnet] = c_net_for_cond
 
-            # Set the conditioning hint - handle different ControlNet types
-            if hasattr(c_net, 'get_control_advanced') or 'PlusPlus' in str(type(c_net)):
-                # ControlNet Plus Plus format - reuse wrapper classes defined earlier
-                c_net.cond_hint_original = ControlHintWrapper(control_hint, strength)
-            else:
-                # Standard ControlNet format - direct tensor
-                c_net.cond_hint_original = control_hint
-            
-            c_net.strength = strength
-            c_net.timestep_percent_range = (start_percent, end_percent)
+                d['control'] = c_net_for_cond
+                d['control_apply_to_uncond'] = False
+                c.append([cond_tensor, d])
+            out.append(c)
 
-            # Link to previous controlnet if one exists
-            if 'control' in n[1]:
-                c_net.previous_controlnet = n[1]['control']
+        # Return the c_net copy so it can be updated with new hints per-frame
+        return out[0], out[1], c_net
 
-            # Set the control net in the conditioning
-            n[1]['control'] = c_net
-            new_negative.append(n)
+    def update_controlnet_hint(self, c_net, img_np, strength, start_percent=0.0, end_percent=1.0):
+        """
+        Update the ControlNet hint image for a new frame (reuses existing copy).
+        Uses set_cond_hint() which updates cond_hint_original.
+        The cached cond_hint is regenerated during the next forward pass.
+        """
+        if c_net is None or img_np is None:
+            return
 
-        # Explicit cleanup to prevent memory leaks
-        del PlusPlusInputWrapper, ControlHintWrapper
-        
-        return new_positive, new_negative, processed_for_return
+        if self.tile_preprocessor != "None":
+            print(f"[frame] Applying {self.tile_preprocessor} preprocessing with blur={self.tile_blur_strength}")
+
+        _, control_hint = self._preprocess_image(img_np)
+        c_net.set_cond_hint(control_hint, strength, (start_percent, end_percent))
 
     def tile_basic_preprocessor(self, image, blur_strength=5.0):
-        """
-        Basic tile preprocessor (tile_resample equivalent)
-        Applies Gaussian blur to the image
-
-        Args:
-            image: Input image as numpy array
-            blur_strength: Strength of blur (0.0-25.0)
-
-        Returns:
-            Processed image
-        """
-        # Ensure image is numpy array
+        """Basic tile preprocessor - applies Gaussian blur"""
         if not isinstance(image, np.ndarray):
             image = np.array(image)
-
-        # Make a copy to avoid modifying the original
         result = image.copy()
-
-        # Apply Gaussian blur - key for tile preprocessor
         if blur_strength > 0:
-            # Calculate kernel size based on blur strength (must be odd)
-            kernel_size = max(3, int(blur_strength * 2)) | 1  # Ensure odd number
+            kernel_size = max(3, int(blur_strength * 2)) | 1
             result = cv2.GaussianBlur(result, (kernel_size, kernel_size), 0)
-
         return result
 
     def tile_colorfix_preprocessor(self, image, blur_strength=5.0):
-        """
-        Enhanced tile preprocessor with color preservation (tile_colorfix equivalent)
-
-        Args:
-            image: Input image as numpy array
-            blur_strength: Strength of blur (0.0-25.0)
-
-        Returns:
-            Processed image
-        """
-        # Ensure image is numpy array
+        """Enhanced tile preprocessor - blurs luminance only, preserving colors"""
         if not isinstance(image, np.ndarray):
             image = np.array(image)
-
-        # Make a copy to avoid modifying the original
         img_copy = image.copy()
-
-        # Convert to LAB color space to preserve colors while blurring
-        # LAB separates luminance from color information
         lab = cv2.cvtColor(img_copy, cv2.COLOR_RGB2LAB)
-
-        # Split channels
         l_channel, a_channel, b_channel = cv2.split(lab)
-
-        # Only blur the L (luminance) channel
         if blur_strength > 0:
-            kernel_size = max(3, int(blur_strength * 2)) | 1  # Ensure odd number
+            kernel_size = max(3, int(blur_strength * 2)) | 1
             l_channel = cv2.GaussianBlur(l_channel, (kernel_size, kernel_size), 0)
-
-        # Merge channels back
         lab = cv2.merge([l_channel, a_channel, b_channel])
-
-        # Convert back to RGB
-        result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-        return result
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)

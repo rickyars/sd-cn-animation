@@ -68,6 +68,38 @@ class ImageProcessor:
         # Resize all images to minimum dimensions
         return [cv2.resize(img, (min_w, min_h)) for img in images]
 
+    def match_histograms(self, source, reference):
+        """
+        Match the histogram of source to reference image (per-channel).
+        Equivalent to skimage.exposure.match_histograms used in reference implementation.
+        Prevents color drift over time by anchoring to the initial frame.
+
+        Args:
+            source: Source image (numpy array, uint8)
+            reference: Reference image to match to (numpy array, uint8)
+
+        Returns:
+            Color-matched image (numpy array, uint8)
+        """
+        result = np.zeros_like(source)
+        for c in range(3):
+            src_vals = source[:, :, c].ravel()
+            ref_vals = reference[:, :, c].ravel()
+
+            # Compute CDFs
+            src_counts, _ = np.histogram(src_vals, bins=256, range=(0, 256))
+            ref_counts, _ = np.histogram(ref_vals, bins=256, range=(0, 256))
+            src_cdf = np.cumsum(src_counts).astype(np.float64)
+            ref_cdf = np.cumsum(ref_counts).astype(np.float64)
+            src_cdf /= src_cdf[-1]
+            ref_cdf /= ref_cdf[-1]
+
+            # Build mapping: for each source intensity, find closest reference intensity
+            mapping = np.interp(src_cdf, ref_cdf, np.arange(256))
+            result[:, :, c] = mapping[source[:, :, c]].astype(np.uint8)
+
+        return result
+
     def apply_color_correction_pipeline(self, image, saturation_limit=200):
         """
         Apply a minimal color correction pipeline

@@ -93,64 +93,41 @@ class FloweRHandler:
 
         return pred_flow, pred_occl, pred_next
 
-    def process_flow(self, pred_flow, pred_occl, pred_next, prev_frame, org_size,
-                     occlusion_mask_multiplier=5.0, occlusion_flow_multiplier=1.0,
-                     occlusion_difo_multiplier=1.0, occlusion_mask_blur=5.0,
-                     occlusion_difs_multiplier=2.0):
+    def process_flow(self, pred_flow, pred_occl, pred_next, org_size,
+                     occlusion_mask_multiplier=10.0, occlusion_mask_blur=0.0):
         """
-        Process flow predictions and create warped frame
+        Process flow predictions - simplified to match reference implementation
+
+        Note: pred_next already contains flow-guided warping from FloweR model,
+        so we don't need to warp again. We just process the occlusion mask.
 
         Args:
-            pred_flow: Raw predicted optical flow
+            pred_flow: Raw predicted optical flow (for visualization only)
             pred_occl: Raw predicted occlusion mask
-            pred_next: Raw predicted next frame
-            prev_frame: Previous frame as reference
+            pred_next: Flow-guided predicted next frame (already warped internally by FloweR)
             org_size: Original size (width, height) to resize outputs
-            occlusion_*: Various occlusion parameters
+            occlusion_mask_multiplier: Multiplier for occlusion mask strength (default: 10.0)
+            occlusion_mask_blur: Gaussian blur sigma for mask smoothing (default: 0.0)
 
         Returns:
-            Dictionary with processed flow outputs
+            Dictionary with processed outputs
         """
-        # Apply multipliers to flow and occlusion
-        pred_flow = pred_flow * occlusion_flow_multiplier
-
-        # General multiplier for the occlusion mask
+        # Clip FIRST, then resize - matches reference implementation order
         pred_occl = np.clip(pred_occl * occlusion_mask_multiplier, 0, 255).astype(np.uint8)
-
-        # Additional processing for flow
-        flow_magnitude = np.linalg.norm(pred_flow, axis=-1, keepdims=True)
-        difo_factor = 1.0 / (1.0 + flow_magnitude * 0.05 * occlusion_difo_multiplier)
-        pred_flow = pred_flow * difo_factor
+        pred_next = np.clip(pred_next, 0, 255).astype(np.uint8)
 
         # Resize to original dimensions
         pred_flow = cv2.resize(pred_flow, org_size)
         pred_occl = cv2.resize(pred_occl, org_size)
         pred_next = cv2.resize(pred_next, org_size)
 
-        # Clean up and ensure proper ranges
-        pred_next = np.clip(pred_next, 0, 255).astype(np.uint8)
-
-        # Process occlusion mask with difs multiplier
-        pred_occl = cv2.GaussianBlur(pred_occl, (21, 21), 2, cv2.BORDER_REFLECT_101)
-        pred_occl = (np.abs(pred_occl / 255.0) ** 1.5) * 255.0 * occlusion_difs_multiplier
-        pred_occl = np.clip(pred_occl, 0, 255).astype(np.uint8)
-
-        # Apply optical flow to warp the previous frame
-        h, w = pred_flow.shape[:2]
-        # Create flow map with sub-pixel precision
-        flow_map = pred_flow.astype(np.float32)
-        flow_map[:, :, 0] += np.arange(w, dtype=np.float32)
-        flow_map[:, :, 1] += np.arange(h, dtype=np.float32)[:, np.newaxis]
-
-        warped_frame = cv2.remap(prev_frame, flow_map, None, cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_REFLECT_101)
-
-        # Blend warped frame with predicted next frame using occlusion mask
-        # Use double precision to minimize quantization errors
-        alpha_mask = pred_occl.astype(np.float64) / 255.0
-        blended_frame = (pred_next.astype(np.float64) * alpha_mask + 
-                        warped_frame.astype(np.float64) * (1.0 - alpha_mask))
-        blended_frame = np.clip(blended_frame, 0, 255).astype(np.uint8)
+        # Optional blur if specified
+        if occlusion_mask_blur > 0:
+            # Calculate blur kernel size based on image dimensions (match reference)
+            h, w = pred_occl.shape[:2]
+            blur_filter_size = min(w, h) // 15 | 1  # Ensure odd number
+            pred_occl = cv2.GaussianBlur(pred_occl, (blur_filter_size, blur_filter_size),
+                                         occlusion_mask_blur, cv2.BORDER_REFLECT)
 
         # Get grayscale occlusion for inpainting
         pred_occl_gray = np.mean(pred_occl, axis=2).astype(np.uint8)
@@ -159,7 +136,5 @@ class FloweRHandler:
             'flow': pred_flow,
             'occlusion': pred_occl,
             'occlusion_gray': pred_occl_gray,
-            'predicted_next': pred_next,
-            'warped_frame': warped_frame,
-            'blended_frame': blended_frame
+            'predicted_next': pred_next
         }
