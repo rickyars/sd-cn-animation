@@ -40,11 +40,15 @@ class Txt2VidNodeAdvanced:
                 "noise": ("NOISE",),
                 "guider": ("GUIDER",),
                 "sampler": ("SAMPLER",),
-                "first_pass_sigmas": ("SIGMAS",),
-                "second_pass_sigmas": ("SIGMAS",),
+                "sigmas": ("SIGMAS",),
                 "latent": ("LATENT",),
                 "vae": ("VAE",),
-                "control_net": ("CONTROL_NET",),
+                "processing_strength": ("FLOAT", {
+                    "default": 0.85, "min": 0.0, "max": 1.0, "step": 0.05
+                }),
+                "fix_frame_strength": ("FLOAT", {
+                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05
+                }),
                 "controlnet_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05
                 }),
@@ -69,14 +73,20 @@ class Txt2VidNodeAdvanced:
                 "occlusion_mask_blur": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1
                 }),
+                "color_correction": ("BOOLEAN", {
+                    "default": True
+                }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 2147483647
                 }),
+            },
+            "optional": {
+                "control_net": ("CONTROL_NET",),
             }
         }
 
-    RETURN_TYPES = ("LATENT", "IMAGE")
-    RETURN_NAMES = ("latent_frames", "debug_frames")
+    RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("latent_frames", "debug_frames", "debug_first_pass", "debug_flower_pred", "debug_occlusion_mask")
     FUNCTION = "generate_frames_advanced"
     CATEGORY = "animation"
 
@@ -109,19 +119,14 @@ class Txt2VidNodeAdvanced:
         return frame_guider
 
     def _sample_frame(self, guider_to_use, sampler, sigmas, latent_image,
-                      noise_seed, noise_mask=None):
-        """Sample one frame using guider.sample()."""
+                      noise_seed, denoise_mask=None):
+        """Sample one frame using guider.sample(), optionally with inpainting mask."""
         noise_tensor = comfy.sample.prepare_noise(latent_image, noise_seed)
-        latent_dict = {"samples": latent_image}
-        if noise_mask is not None:
-            latent_dict["noise_mask"] = noise_mask
 
         latent_fixed = comfy.sample.fix_empty_latent_channels(
-            guider_to_use.model_patcher, latent_dict["samples"],
-            latent_dict.get("downscale_ratio_spacial", None)
+            guider_to_use.model_patcher, latent_image
         )
 
-        denoise_mask = latent_dict.get("noise_mask", None)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         callback = latent_preview.prepare_callback(
             guider_to_use.model_patcher, sigmas.shape[-1] - 1
@@ -135,11 +140,32 @@ class Txt2VidNodeAdvanced:
         samples = samples.to(comfy.model_management.intermediate_device())
         return samples
 
-    def generate_frames_advanced(self, noise, guider, sampler, first_pass_sigmas, second_pass_sigmas,
-                                latent, vae, control_net, controlnet_strength,
+    @staticmethod
+    def _truncate_sigmas(sigmas, strength):
+        """Truncate sigma schedule like A1111: take the last (strength * total_steps) sigmas.
+
+        Given a full schedule of N steps (N+1 values including terminal 0),
+        A1111 computes: steps_used = int(strength * N), then uses the last steps_used sigmas.
+        """
+        total_steps = sigmas.shape[0] - 1  # exclude terminal 0
+        steps_used = max(1, int(strength * total_steps))
+        # Take last steps_used sigmas + terminal 0
+        truncated = sigmas[-(steps_used + 1):]
+        return truncated
+
+    def generate_frames_advanced(self, noise, guider, sampler, sigmas,
+                                latent, vae,
+                                processing_strength, fix_frame_strength,
+                                controlnet_strength,
                                 controlnet_start_percent, controlnet_end_percent,
                                 num_frames, tile_preprocessor, tile_blur_strength,
-                                occlusion_mask_multiplier, occlusion_mask_blur, seed):
+                                occlusion_mask_multiplier, occlusion_mask_blur,
+                                color_correction, seed,
+                                control_net=None):
+        # Split the single sigma schedule into two passes (A1111-style truncation)
+        first_pass_sigmas = self._truncate_sigmas(sigmas, processing_strength)
+        second_pass_sigmas = self._truncate_sigmas(sigmas, fix_frame_strength)
+
         model = guider.model_patcher
         self.diffusion.model = model
         self.diffusion.vae = vae
@@ -166,7 +192,11 @@ class Txt2VidNodeAdvanced:
         prev_frame = init_frame_np.copy()
 
         second_pass_latents = [latent["samples"].to(device)]
-        debug_frames = [torch.from_numpy(init_frame_np.astype(np.float32) / 255.0)]
+        init_frame_tensor = torch.from_numpy(init_frame_np.astype(np.float32) / 255.0)
+        debug_frames = [init_frame_tensor]
+        debug_first_pass_frames = [init_frame_tensor]
+        debug_flower_frames = [init_frame_tensor]
+        debug_mask_frames = [torch.zeros_like(init_frame_tensor)]  # black mask for frame 1 (no occlusion)
 
         pbar = ProgressBar(num_frames)
         use_controlnet = control_net is not None and controlnet_strength > 0
@@ -186,6 +216,10 @@ class Txt2VidNodeAdvanced:
                 controlnet_strength, controlnet_start_percent, controlnet_end_percent
             )
 
+        total_steps = sigmas.shape[0] - 1
+        print(f"Full sigmas ({total_steps} steps): {sigmas.tolist()}")
+        print(f"First pass (strength={processing_strength}): {first_pass_sigmas.shape[0]-1} steps, sigmas={first_pass_sigmas.tolist()}")
+        print(f"Second pass (strength={fix_frame_strength}): {second_pass_sigmas.shape[0]-1} steps, sigmas={second_pass_sigmas.tolist()}")
         print(f"Generating {num_frames} frames")
         for i in range(num_frames - 1):
             print(f"Processing frame {i + 2}/{num_frames}")
@@ -201,6 +235,18 @@ class Txt2VidNodeAdvanced:
             pred_occl_gray = flow_result['occlusion_gray']
             pred_next = flow_result['predicted_next']
 
+            # Collect debug: raw FloweR prediction and occlusion mask
+            debug_flower_frames.append(torch.from_numpy(pred_next.astype(np.float32) / 255.0))
+            # Convert grayscale mask to 3-channel for IMAGE output
+            mask_rgb = np.stack([pred_occl_gray] * 3, axis=-1)
+            debug_mask_frames.append(torch.from_numpy(mask_rgb.astype(np.float32) / 255.0))
+
+            if i == 0:
+                mask_min, mask_max, mask_mean = pred_occl_gray.min(), pred_occl_gray.max(), pred_occl_gray.mean()
+                print(f"  Occlusion mask stats: min={mask_min}, max={mask_max}, mean={mask_mean:.1f}")
+                print(f"  noise_mask shape: will be [1, 1, {pred_occl_gray.shape[0]}, {pred_occl_gray.shape[1]}]")
+                print(f"  blended_latent shape: will be {self.diffusion.encode_with_vae(Image.fromarray(pred_next), device).shape}")
+
             # Update hint image on existing ControlNet copy (no new copies created)
             if use_controlnet:
                 self.controlnet.update_controlnet_hint(
@@ -213,41 +259,52 @@ class Txt2VidNodeAdvanced:
             else:
                 frame_guider = guider
 
-            # First pass: inpaint occluded areas
+            # First pass: inpaint occluded areas (composite-at-end)
             pred_next_pil = Image.fromarray(pred_next)
             blended_latent = self.diffusion.encode_with_vae(pred_next_pil, device)
 
-            mask_np = np.array(pred_occl_gray).astype(np.float32) / 255.0
-            mask_tensor = torch.from_numpy(mask_np).to(device)
-            noise_mask = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
-
             frame_seed = noise.seed + i if noise.seed != 0 else i
 
-            first_pass_samples = self._sample_frame(
+            # Denoise the full image without any mask
+            first_pass_raw = self._sample_frame(
                 frame_guider, sampler, first_pass_sigmas,
-                blended_latent, frame_seed, noise_mask=noise_mask
+                blended_latent, frame_seed
             )
 
-            # Decode, histogram match, re-encode
+            # Composite unmasked (non-occluded) regions back from original
+            mask_np = np.array(pred_occl_gray).astype(np.float32) / 255.0
+            mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
+            latent_mask = torch.nn.functional.interpolate(
+                mask_tensor, size=blended_latent.shape[2:], mode='bilinear', align_corners=False
+            )
+            first_pass_raw = first_pass_raw.to(device)
+            blended_latent = blended_latent.to(device)
+            latent_mask = latent_mask.to(device)
+            first_pass_samples = first_pass_raw * latent_mask + blended_latent * (1.0 - latent_mask)
+
+            # Decode, optionally histogram match, re-encode
             first_pass_frame_np = self.diffusion.decode_latent(first_pass_samples.to(device))
-            first_pass_frame_np = self.image_processor.match_histograms(first_pass_frame_np, init_frame_np)
+            if color_correction:
+                first_pass_frame_np = self.image_processor.match_histograms(first_pass_frame_np, init_frame_np)
             first_pass_frame_np = np.clip(first_pass_frame_np, 0, 255).astype(np.uint8)
+            debug_first_pass_frames.append(torch.from_numpy(first_pass_frame_np.astype(np.float32) / 255.0))
             second_pass_input = self.diffusion.encode_with_vae(
                 Image.fromarray(first_pass_frame_np), device
             )
 
-            # Second pass: refine entire frame
+            # Second pass: refine entire frame (no mask)
             second_seed = frame_seed + 10000
             second_pass_samples = self._sample_frame(
                 frame_guider, sampler, second_pass_sigmas,
-                second_pass_input, second_seed, noise_mask=None
+                second_pass_input, second_seed
             )
 
             second_pass_samples = second_pass_samples.to(device)
             second_pass_latents.append(second_pass_samples)
 
             final_frame_np = self.diffusion.decode_latent(second_pass_samples)
-            final_frame_np = self.image_processor.match_histograms(final_frame_np, init_frame_np)
+            if color_correction:
+                final_frame_np = self.image_processor.match_histograms(final_frame_np, init_frame_np)
             final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
 
             debug_frames.append(torch.from_numpy(final_frame_np.astype(np.float32) / 255.0))
@@ -256,6 +313,9 @@ class Txt2VidNodeAdvanced:
 
         stacked_latents = torch.cat(second_pass_latents, dim=0)
         stacked_images = torch.stack(debug_frames, dim=0)
+        stacked_first_pass = torch.stack(debug_first_pass_frames, dim=0)
+        stacked_flower = torch.stack(debug_flower_frames, dim=0)
+        stacked_masks = torch.stack(debug_mask_frames, dim=0)
 
         # Clean up ControlNet state (frees cached hint tensors)
         if c_net_copy is not None:
@@ -264,7 +324,7 @@ class Txt2VidNodeAdvanced:
         self.flower.clear_memory()
         print("Animation generation complete")
 
-        return ({"samples": stacked_latents}, stacked_images)
+        return ({"samples": stacked_latents}, stacked_images, stacked_first_pass, stacked_flower, stacked_masks)
 
 
 NODE_CLASS_MAPPINGS = {
