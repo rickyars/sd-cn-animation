@@ -18,7 +18,6 @@ from .components import (
     ControlNetHandler,
     DiffusionHandler,
     ImageProcessor,
-    VisualizationHandler
 )
 from .utils import latent_utils
 
@@ -31,7 +30,6 @@ class Txt2VidNodeAdvanced:
         self.controlnet = ControlNetHandler()
         self.diffusion = DiffusionHandler()
         self.image_processor = ImageProcessor()
-        self.visualization = VisualizationHandler()
 
     @classmethod
     def INPUT_TYPES(s):
@@ -70,8 +68,8 @@ class Txt2VidNodeAdvanced:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("latent_frames", "debug_frames", "debug_first_pass", "debug_flower_pred", "debug_occlusion_mask")
+    RETURN_TYPES = ("LATENT", "IMAGE")
+    RETURN_NAMES = ("latent_frames", "frames")
     FUNCTION = "generate_frames_advanced"
     CATEGORY = "animation"
 
@@ -173,7 +171,6 @@ class Txt2VidNodeAdvanced:
         latent_on_device = latent_utils.ensure_latent_on_device(latent, device)
         init_frame_np = self.diffusion.decode_latent(latent_on_device["samples"])
         height, width = init_frame_np.shape[:2]
-        print(f"Initial frame: {width}x{height}")
 
         # Load FloweR
         size = (width // 128) * 128, (height // 128) * 128
@@ -188,10 +185,7 @@ class Txt2VidNodeAdvanced:
 
         second_pass_latents = [latent["samples"].to(device)]
         init_frame_tensor = torch.from_numpy(init_frame_np.astype(np.float32) / 255.0)
-        debug_frames = [init_frame_tensor]
-        debug_first_pass_frames = [init_frame_tensor]
-        debug_flower_frames = [init_frame_tensor]
-        debug_mask_frames = [torch.zeros_like(init_frame_tensor)]  # black mask for frame 1 (no occlusion)
+        output_frames = [init_frame_tensor]
 
         pbar = ProgressBar(num_frames)
         use_controlnet = control_net is not None and controlnet_strength > 0
@@ -200,24 +194,20 @@ class Txt2VidNodeAdvanced:
         # Each frame we only update the hint image on this same copy.
         cn_positive = cn_negative = c_net_copy = None
         if use_controlnet:
-            # Pre-load ControlNet into VRAM
             if hasattr(control_net, 'get_models'):
-                cn_models = control_net.get_models()
-                comfy.model_management.load_models_gpu(cn_models)
-                print(f"Pre-loaded ControlNet into VRAM")
+                comfy.model_management.load_models_gpu(control_net.get_models())
 
             cn_positive, cn_negative, c_net_copy = self._setup_controlnet_conds(
                 guider, control_net, prev_frame,
                 controlnet_strength, controlnet_start_percent, controlnet_end_percent
             )
 
-        total_steps = sigmas.shape[0] - 1
-        print(f"Full sigmas ({total_steps} steps): {sigmas.tolist()}")
-        print(f"First pass (strength={processing_strength}): {first_pass_sigmas.shape[0]-1} steps, sigmas={first_pass_sigmas.tolist()}")
-        print(f"Second pass (strength={fix_frame_strength}): {second_pass_sigmas.shape[0]-1} steps, sigmas={second_pass_sigmas.tolist()}")
-        print(f"Generating {num_frames} frames")
+        print(f"SD-CN Animation: {num_frames} frames @ {width}x{height}, "
+              f"first pass {first_pass_sigmas.shape[0]-1} steps, "
+              f"second pass {second_pass_sigmas.shape[0]-1} steps"
+              f"{', ControlNet enabled' if use_controlnet else ''}")
         for i in range(num_frames - 1):
-            print(f"Processing frame {i + 2}/{num_frames}")
+            print(f"  Frame {i + 2}/{num_frames}")
 
             clip_frames = np.roll(clip_frames, -1, axis=0)
             clip_frames[-1] = cv2.resize(prev_frame, size)
@@ -229,18 +219,6 @@ class Txt2VidNodeAdvanced:
             )
             pred_occl_gray = flow_result['occlusion_gray']
             pred_next = flow_result['predicted_next']
-
-            # Collect debug: raw FloweR prediction and occlusion mask
-            debug_flower_frames.append(torch.from_numpy(pred_next.astype(np.float32) / 255.0))
-            # Convert grayscale mask to 3-channel for IMAGE output
-            mask_rgb = np.stack([pred_occl_gray] * 3, axis=-1)
-            debug_mask_frames.append(torch.from_numpy(mask_rgb.astype(np.float32) / 255.0))
-
-            if i == 0:
-                mask_min, mask_max, mask_mean = pred_occl_gray.min(), pred_occl_gray.max(), pred_occl_gray.mean()
-                print(f"  Occlusion mask stats: min={mask_min}, max={mask_max}, mean={mask_mean:.1f}")
-                print(f"  noise_mask shape: will be [1, 1, {pred_occl_gray.shape[0]}, {pred_occl_gray.shape[1]}]")
-                print(f"  blended_latent shape: will be {self.diffusion.encode_with_vae(Image.fromarray(pred_next), device).shape}")
 
             # Update hint image on existing ControlNet copy (no new copies created)
             if use_controlnet:
@@ -254,35 +232,32 @@ class Txt2VidNodeAdvanced:
             else:
                 frame_guider = guider
 
-            # First pass: inpaint occluded areas (composite-at-end)
+            # First pass: denoise full image, then composite-at-end
             pred_next_pil = Image.fromarray(pred_next)
             blended_latent = self.diffusion.encode_with_vae(pred_next_pil, device)
 
             frame_seed = noise.seed + i if noise.seed != 0 else i
 
-            # Denoise the full image without any mask
             first_pass_raw = self._sample_frame(
                 frame_guider, sampler, first_pass_sigmas,
                 blended_latent, frame_seed
             )
 
-            # Composite unmasked (non-occluded) regions back from original
-            mask_np = np.array(pred_occl_gray).astype(np.float32) / 255.0
-            mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
-            latent_mask = torch.nn.functional.interpolate(
-                mask_tensor, size=blended_latent.shape[2:], mode='bilinear', align_corners=False
+            # Composite: keep non-occluded from original, use diffused for occluded
+            mask_np = pred_occl_gray.astype(np.float32) / 255.0
+            mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
+            mask_t = torch.nn.functional.interpolate(
+                mask_t, size=blended_latent.shape[2:], mode='bilinear', align_corners=False
             )
             first_pass_raw = first_pass_raw.to(device)
             blended_latent = blended_latent.to(device)
-            latent_mask = latent_mask.to(device)
-            first_pass_samples = first_pass_raw * latent_mask + blended_latent * (1.0 - latent_mask)
+            first_pass_samples = first_pass_raw * mask_t + blended_latent * (1.0 - mask_t)
 
             # Decode, optionally histogram match, re-encode
             first_pass_frame_np = self.diffusion.decode_latent(first_pass_samples.to(device))
             if color_correction:
                 first_pass_frame_np = self.image_processor.match_histograms(first_pass_frame_np, init_frame_np)
             first_pass_frame_np = np.clip(first_pass_frame_np, 0, 255).astype(np.uint8)
-            debug_first_pass_frames.append(torch.from_numpy(first_pass_frame_np.astype(np.float32) / 255.0))
             second_pass_input = self.diffusion.encode_with_vae(
                 Image.fromarray(first_pass_frame_np), device
             )
@@ -302,24 +277,20 @@ class Txt2VidNodeAdvanced:
                 final_frame_np = self.image_processor.match_histograms(final_frame_np, init_frame_np)
             final_frame_np = np.clip(final_frame_np, 0, 255).astype(np.uint8)
 
-            debug_frames.append(torch.from_numpy(final_frame_np.astype(np.float32) / 255.0))
+            output_frames.append(torch.from_numpy(final_frame_np.astype(np.float32) / 255.0))
             prev_frame = final_frame_np.copy()
             pbar.update(1)
 
         stacked_latents = torch.cat(second_pass_latents, dim=0)
-        stacked_images = torch.stack(debug_frames, dim=0)
-        stacked_first_pass = torch.stack(debug_first_pass_frames, dim=0)
-        stacked_flower = torch.stack(debug_flower_frames, dim=0)
-        stacked_masks = torch.stack(debug_mask_frames, dim=0)
+        stacked_images = torch.stack(output_frames, dim=0)
 
         # Clean up ControlNet state (frees cached hint tensors)
         if c_net_copy is not None:
             c_net_copy.cleanup()
 
         self.flower.clear_memory()
-        print("Animation generation complete")
 
-        return ({"samples": stacked_latents}, stacked_images, stacked_first_pass, stacked_flower, stacked_masks)
+        return ({"samples": stacked_latents}, stacked_images)
 
 
 NODE_CLASS_MAPPINGS = {

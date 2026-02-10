@@ -47,11 +47,7 @@ class ControlNetHandler:
             c_net_copy is the ControlNet copy to be used for updating hints in subsequent frames.
         """
         if control_net is None or img_np is None or strength == 0:
-            print(f"[{preprocessing_step}] Skipping ControlNet: None or strength=0")
             return positive, negative, None
-
-        if self.tile_preprocessor != "None":
-            print(f"[{preprocessing_step}] Applying {self.tile_preprocessor} preprocessing with blur={self.tile_blur_strength}")
 
         processed_img, control_hint = self._preprocess_image(img_np)
 
@@ -72,8 +68,6 @@ class ControlNetHandler:
                 c_net.control_model_wrapped = control_net.control_model_wrapped
 
         c_net.set_cond_hint(control_hint, strength, (start_percent, end_percent))
-
-        print(f"[{preprocessing_step}] ControlNet applied: type={type(control_net).__name__}, strength={strength}")
 
         # Build new conditioning with ControlNet attached
         # Uses same pattern as ComfyUI's ControlNetApplyAdvanced node
@@ -123,9 +117,6 @@ class ControlNetHandler:
         """
         if c_net is None or img_np is None:
             return
-
-        if self.tile_preprocessor != "None":
-            print(f"[frame] Applying {self.tile_preprocessor} preprocessing with blur={self.tile_blur_strength}")
 
         _, control_hint = self._preprocess_image(img_np)
         c_net.set_cond_hint(control_hint, strength, (start_percent, end_percent))
