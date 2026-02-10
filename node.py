@@ -1,6 +1,7 @@
 """
-Advanced node implementation for SD-CN Animation.
-Uses ComfyUI's advanced sampling API (NOISE, GUIDER, SAMPLER, SIGMAS inputs).
+Standard node implementation for SD-CN Animation.
+Uses KSampler-style inputs (MODEL, CONDITIONING, sampler_name, scheduler, etc.)
+for compatibility with workflows like z-image that don't use the advanced sampling API.
 """
 import comfy.utils
 import comfy.samplers
@@ -12,9 +13,9 @@ from .components import ControlNetHandler
 from .animation_core import run_animation_loop, truncate_sigmas
 
 
-class Txt2VidNodeAdvanced:
-    """Advanced Text to Video node using FloweR flow + two-pass diffusion.
-    Uses the advanced ComfyUI sampling API (split NOISE/GUIDER/SAMPLER/SIGMAS inputs).
+class Txt2VidNode:
+    """Text to Video node using FloweR flow + two-pass diffusion.
+    Uses KSampler-style inputs (MODEL, CONDITIONING, sampler_name, scheduler).
     """
 
     def __init__(self):
@@ -24,12 +25,23 @@ class Txt2VidNodeAdvanced:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "noise": ("NOISE",),
-                "guider": ("GUIDER",),
-                "sampler": ("SAMPLER",),
-                "sigmas": ("SIGMAS",),
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
                 "latent": ("LATENT",),
                 "vae": ("VAE",),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True
+                }),
+                "steps": ("INT", {
+                    "default": 25, "min": 1, "max": 10000
+                }),
+                "cfg": ("FLOAT", {
+                    "default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1
+                }),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
                 "processing_strength": ("FLOAT", {
                     "default": 0.85, "min": 0.0, "max": 1.0, "step": 0.05
                 }),
@@ -48,9 +60,6 @@ class Txt2VidNodeAdvanced:
                 "color_correction": ("BOOLEAN", {
                     "default": True
                 }),
-                "seed": ("INT", {
-                    "default": 0, "min": 0, "max": 2147483647
-                }),
             },
             "optional": {
                 "cn_config": ("SDCN_CN_CONFIG",),
@@ -59,18 +68,23 @@ class Txt2VidNodeAdvanced:
 
     RETURN_TYPES = ("LATENT", "IMAGE")
     RETURN_NAMES = ("latent_frames", "frames")
-    FUNCTION = "generate_frames_advanced"
+    FUNCTION = "generate_frames"
     CATEGORY = "animation"
 
-    def generate_frames_advanced(self, noise, guider, sampler, sigmas,
-                                latent, vae,
-                                processing_strength, fix_frame_strength,
-                                num_frames,
-                                occlusion_mask_multiplier, occlusion_mask_blur,
-                                color_correction, seed,
-                                cn_config=None):
-        first_pass_sigmas = truncate_sigmas(sigmas, processing_strength)
-        second_pass_sigmas = truncate_sigmas(sigmas, fix_frame_strength)
+    def generate_frames(self, model, positive, negative, latent, vae,
+                       seed, steps, cfg, sampler_name, scheduler,
+                       processing_strength, fix_frame_strength,
+                       num_frames,
+                       occlusion_mask_multiplier, occlusion_mask_blur,
+                       color_correction,
+                       cn_config=None):
+        # Compute full sigma schedule from model, then truncate for each pass
+        model_sampling = model.get_model_object("model_sampling")
+        full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps)
+        full_sigmas = full_sigmas.to(model.load_device)
+
+        first_pass_sigmas = truncate_sigmas(full_sigmas, processing_strength)
+        second_pass_sigmas = truncate_sigmas(full_sigmas, fix_frame_strength)
 
         # Set up ControlNet state (populated lazily via on_init callback)
         use_controlnet = False
@@ -78,8 +92,9 @@ class Txt2VidNodeAdvanced:
         controlnet_strength = 0
         controlnet_start_percent = 0.0
         controlnet_end_percent = 1.0
-        # Mutable state for closures
-        cn_state = {"positive": None, "negative": None, "c_net_copy": None}
+        # Mutable conditioning — may be replaced by CN setup
+        cond_state = {"positive": positive, "negative": negative}
+        cn_state = {"c_net_copy": None}
 
         if cn_config is not None:
             control_net = cn_config["control_net"]
@@ -94,45 +109,36 @@ class Txt2VidNodeAdvanced:
             if use_controlnet and hasattr(control_net, 'get_models'):
                 comfy.model_management.load_models_gpu(control_net.get_models())
 
-        # Called once after initial frame is decoded — sets up CN with real image
+        # Called once after initial frame is decoded
         def on_init(init_frame_np):
             if not use_controlnet:
                 return
-            positive_cond = guider.original_conds.get("positive", [])
-            negative_cond = guider.original_conds.get("negative", [])
-            if not isinstance(positive_cond, list):
-                positive_cond = [positive_cond] if positive_cond is not None else []
-            if not isinstance(negative_cond, list):
-                negative_cond = [negative_cond] if negative_cond is not None else []
-
-            pos, neg, c_net_copy = self.controlnet.apply_controlnet(
-                init_frame_np, positive_cond, negative_cond, control_net,
+            cn_pos, cn_neg, c_net_copy = self.controlnet.apply_controlnet(
+                init_frame_np, positive, negative, control_net,
                 controlnet_strength, controlnet_start_percent, controlnet_end_percent,
                 preprocessing_step="frame"
             )
-            cn_state["positive"] = pos
-            cn_state["negative"] = neg
+            cond_state["positive"] = cn_pos
+            cond_state["negative"] = cn_neg
             cn_state["c_net_copy"] = c_net_copy
 
-        # Build the per-frame sampling function
-        def sample_frame(latent_image, frame_seed, frame_sigmas):
-            if use_controlnet:
-                frame_guider = comfy.samplers.CFGGuider(guider.model_patcher)
-                frame_guider.set_conds(cn_state["positive"], cn_state["negative"])
-                frame_guider.set_cfg(guider.cfg)
-            else:
-                frame_guider = guider
+        # Build per-frame sampling function using KSampler internals
+        sampler_obj = comfy.samplers.sampler_object(sampler_name)
 
+        def sample_frame(latent_image, frame_seed, frame_sigmas):
             noise_tensor = comfy.sample.prepare_noise(latent_image, frame_seed)
-            latent_fixed = comfy.sample.fix_empty_latent_channels(
-                frame_guider.model_patcher, latent_image
-            )
+            latent_fixed = comfy.sample.fix_empty_latent_channels(model, latent_image)
+
+            cfg_guider = comfy.samplers.CFGGuider(model)
+            cfg_guider.set_conds(cond_state["positive"], cond_state["negative"])
+            cfg_guider.set_cfg(cfg)
+
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
             callback = latent_preview.prepare_callback(
-                frame_guider.model_patcher, frame_sigmas.shape[-1] - 1
+                model, frame_sigmas.shape[-1] - 1
             )
-            samples = frame_guider.sample(
-                noise_tensor, latent_fixed, sampler, frame_sigmas,
+            samples = cfg_guider.sample(
+                noise_tensor, latent_fixed, sampler_obj, frame_sigmas,
                 callback=callback, disable_pbar=disable_pbar, seed=frame_seed
             )
             return samples.to(comfy.model_management.intermediate_device())
@@ -148,12 +154,12 @@ class Txt2VidNodeAdvanced:
             result = run_animation_loop(
                 sample_frame_fn=sample_frame,
                 vae=vae,
-                model_patcher=guider.model_patcher,
+                model_patcher=model,
                 latent=latent,
                 first_pass_sigmas=first_pass_sigmas,
                 second_pass_sigmas=second_pass_sigmas,
                 num_frames=num_frames,
-                base_seed=noise.seed,
+                base_seed=seed,
                 occlusion_mask_multiplier=occlusion_mask_multiplier,
                 occlusion_mask_blur=occlusion_mask_blur,
                 color_correction=color_correction,
@@ -168,9 +174,9 @@ class Txt2VidNodeAdvanced:
 
 
 NODE_CLASS_MAPPINGS = {
-    "SDCNAnimationAdvanced": Txt2VidNodeAdvanced
+    "SDCNAnimation": Txt2VidNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SDCNAnimationAdvanced": "SD-CN Animation Advanced"
+    "SDCNAnimation": "SD-CN Animation"
 }
