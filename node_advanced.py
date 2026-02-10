@@ -183,8 +183,7 @@ class Txt2VidNodeAdvanced:
 
         self.flower.load_model(size[0], size[1])
 
-        init_resized = cv2.resize(init_frame_np, size)
-        clip_frames = np.stack([init_resized] * 4, axis=0)
+        clip_frames = np.zeros((4, size[1], size[0], 3), dtype=np.uint8)
         prev_frame = init_frame_np.copy()
 
         second_pass_latents = [latent["samples"].to(device)]
