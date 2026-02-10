@@ -49,23 +49,8 @@ class Txt2VidNodeAdvanced:
                 "fix_frame_strength": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05
                 }),
-                "controlnet_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05
-                }),
-                "controlnet_start_percent": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01
-                }),
-                "controlnet_end_percent": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01
-                }),
                 "num_frames": ("INT", {
                     "default": 16, "min": 2, "max": 1000, "step": 1
-                }),
-                "tile_preprocessor": (["None", "Basic", "ColorFix"], {
-                    "default": "ColorFix"
-                }),
-                "tile_blur_strength": ("FLOAT", {
-                    "default": 5.0, "min": 0.0, "max": 25.0, "step": 0.1
                 }),
                 "occlusion_mask_multiplier": ("FLOAT", {
                     "default": 10.0, "min": 0.0, "max": 50.0, "step": 0.5
@@ -81,7 +66,7 @@ class Txt2VidNodeAdvanced:
                 }),
             },
             "optional": {
-                "control_net": ("CONTROL_NET",),
+                "cn_config": ("SDCN_CN_CONFIG",),
             }
         }
 
@@ -156,12 +141,24 @@ class Txt2VidNodeAdvanced:
     def generate_frames_advanced(self, noise, guider, sampler, sigmas,
                                 latent, vae,
                                 processing_strength, fix_frame_strength,
-                                controlnet_strength,
-                                controlnet_start_percent, controlnet_end_percent,
-                                num_frames, tile_preprocessor, tile_blur_strength,
+                                num_frames,
                                 occlusion_mask_multiplier, occlusion_mask_blur,
                                 color_correction, seed,
-                                control_net=None):
+                                cn_config=None):
+        # Unpack ControlNet config (if provided)
+        control_net = None
+        controlnet_strength = 0
+        controlnet_start_percent = 0.0
+        controlnet_end_percent = 1.0
+        if cn_config is not None:
+            control_net = cn_config["control_net"]
+            controlnet_strength = cn_config["strength"]
+            controlnet_start_percent = cn_config["start_percent"]
+            controlnet_end_percent = cn_config["end_percent"]
+            self.controlnet.set_preprocessor(
+                cn_config["tile_preprocessor"], cn_config["tile_blur_strength"]
+            )
+
         # Split the single sigma schedule into two passes (A1111-style truncation)
         first_pass_sigmas = self._truncate_sigmas(sigmas, processing_strength)
         second_pass_sigmas = self._truncate_sigmas(sigmas, fix_frame_strength)
@@ -169,7 +166,6 @@ class Txt2VidNodeAdvanced:
         model = guider.model_patcher
         self.diffusion.model = model
         self.diffusion.vae = vae
-        self.controlnet.set_preprocessor(tile_preprocessor, tile_blur_strength)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
