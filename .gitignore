@@ -51,3 +51,8 @@ EOL
 # Add and commit the .gitignore file
 git add .gitignore
 git commit -m "Add .gitignore file"
+
+# IDE related
+.claude/
+.vscode/
+reference/
